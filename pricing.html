@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pricing — SwiftKit</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#07070F;color:#F0F0FF;}
+nav{background:#0E0E1A;padding:16px 40px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #1E1E30;}
+.logo{font-size:20px;font-weight:900;background:linear-gradient(135deg,#FF8C5A,#FFD580);-webkit-background-clip:text;-webkit-text-fill-color:transparent;text-decoration:none;}
+.nav-links a{color:#888;text-decoration:none;margin-left:24px;font-size:14px;}
+.nav-links a:hover{color:#FF6B35;}
+.hero{text-align:center;padding:60px 20px 40px;}
+.hero h1{font-size:38px;font-weight:900;margin-bottom:12px;}
+.hero p{font-size:16px;color:#666;max-width:460px;margin:0 auto;}
+.plans{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px;max-width:800px;margin:40px auto 80px;padding:0 20px;}
+.plan{background:#0E0E1A;border:1px solid #1E1E30;border-radius:16px;padding:28px;position:relative;}
+.plan.best{border-color:#FF6B35;box-shadow:0 0 30px #FF6B3520;}
+.best-badge{position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#FF6B35,#FFB347);color:#050000;font-size:10px;font-weight:900;padding:4px 14px;border-radius:12px;white-space:nowrap;letter-spacing:.5px;}
+.plan-name{font-size:14px;color:#888;font-weight:600;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px;}
+.plan-price{font-size:36px;font-weight:900;color:#FF6B35;margin-bottom:4px;}
+.plan-period{font-size:13px;color:#555;margin-bottom:20px;}
+.plan-features{margin-bottom:24px;}
+.feat{font-size:13px;color:#888;margin-bottom:8px;display:flex;align-items:center;gap:8px;}
+.feat.yes{color:#F0F0FF;}
+.feat.yes::before{content:'✓';color:#22C55E;font-weight:800;}
+.feat.no::before{content:'✗';color:#333;}
+.plan-btn{display:block;width:100%;padding:12px;text-align:center;border-radius:10px;font-size:14px;font-weight:800;text-decoration:none;transition:.2s;cursor:pointer;border:none;font-family:inherit;}
+.btn-free{background:#1E1E30;color:#888;border:1px solid #252538;}
+.btn-paid{background:linear-gradient(135deg,#FF6B35,#FF2000);color:#fff;box-shadow:0 4px 20px #FF6B3540;}
+.btn-paid:hover{transform:translateY(-1px);box-shadow:0 6px 28px #FF6B3560;}
+.note{text-align:center;font-size:13px;color:#444;padding:0 20px 60px;}
+.note a{color:#FF6B35;text-decoration:none;}
+footer{background:#0E0E1A;border-top:1px solid #1E1E30;padding:24px 40px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;}
+footer a{color:#555;text-decoration:none;font-size:13px;margin-left:20px;}
+.copy{color:#333;font-size:13px;}
+</style>
+</head>
+<body>
+
+<nav>
+  <a class="logo" href="index.html">⚡ SwiftKit</a>
+  <div class="nav-links">
+    <a href="index.html">Home</a>
+    <a href="pricing.html">Pricing</a>
+    <a href="privacy.html">Privacy</a>
+    <a href="terms.html">Terms</a>
+  </div>
+</nav>
+
+<div class="hero">
+  <h1>Simple, Honest Pricing</h1>
+  <p>Start free. Upgrade when you need more power. No hidden fees ever.</p>
+</div>
+
+<div class="plans">
+
+  <!-- FREE -->
+  <div class="plan">
+    <div class="plan-name">SlotSniper Free</div>
+    <div class="plan-price">$0</div>
+    <div class="plan-period">forever · no credit card</div>
+    <div class="plan-features">
+      <div class="feat yes">Up to 3 trackers</div>
+      <div class="feat yes">Check every 60 seconds</div>
+      <div class="feat yes">Browser notifications</div>
+      <div class="feat yes">12+ site templates</div>
+      <div class="feat yes">Activity logs</div>
+      <div class="feat no" style="color:#333">WhatsApp alerts</div>
+      <div class="feat no" style="color:#333">Unlimited trackers</div>
+      <div class="feat no" style="color:#333">30-second checking</div>
+    </div>
+    <a href="https://chrome.google.com/webstore" class="plan-btn btn-free">Download Free</a>
+  </div>
+
+  <!-- MONTHLY -->
+  <div class="plan">
+    <div class="plan-name">SlotSniper Pro</div>
+    <div class="plan-price">$4.99</div>
+    <div class="plan-period">per month · cancel anytime</div>
+    <div class="plan-features">
+      <div class="feat yes">Unlimited trackers</div>
+      <div class="feat yes">Check every 30 seconds</div>
+      <div class="feat yes">WhatsApp alerts (instant)</div>
+      <div class="feat yes">Browser notifications</div>
+      <div class="feat yes">12+ site templates</div>
+      <div class="feat yes">Priority support</div>
+      <div class="feat yes">All future updates</div>
+    </div>
+    <a href="#" class="plan-btn btn-paid">Subscribe — $4.99/mo</a>
+  </div>
+
+  <!-- LIFETIME -->
+  <div class="plan best">
+    <div class="best-badge">🔥 BEST VALUE</div>
+    <div class="plan-name">SlotSniper Lifetime</div>
+    <div class="plan-price">$29</div>
+    <div class="plan-period">one time · yours forever</div>
+    <div class="plan-features">
+      <div class="feat yes">Everything in Pro</div>
+      <div class="feat yes">Unlimited trackers</div>
+      <div class="feat yes">30-second checking</div>
+      <div class="feat yes">WhatsApp alerts</div>
+      <div class="feat yes">All future updates free</div>
+      <div class="feat yes">Lifetime license key</div>
+      <div class="feat yes" style="color:#FFB347">Save $30+ per year</div>
+    </div>
+    <a href="#" class="plan-btn btn-paid">Get Lifetime — $29</a>
+  </div>
+
+</div>
+
+<p class="note">
+  Payments processed securely by Paddle. Accepts all major cards, PayPal, and bank transfer.<br>
+  Questions? <a href="mailto:support@swiftkit.app">support@swiftkit.app</a> · 
+  <a href="refund.html">30-day refund policy</a>
+</p>
+
+<footer>
+  <span class="copy">© 2026 SwiftKit. All rights reserved.</span>
+  <div>
+    <a href="privacy.html">Privacy Policy</a>
+    <a href="terms.html">Terms of Service</a>
+    <a href="refund.html">Refund Policy</a>
+  </div>
+</footer>
+
+</body>
+</html>

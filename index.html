@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SwiftKit — Browser Tools</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#07070F;color:#F0F0FF;}
+nav{background:#0E0E1A;padding:16px 40px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #1E1E30;}
+.logo{font-size:20px;font-weight:900;background:linear-gradient(135deg,#FF8C5A,#FFD580);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.nav-links a{color:#888;text-decoration:none;margin-left:24px;font-size:14px;}
+.nav-links a:hover{color:#FF6B35;}
+.hero{text-align:center;padding:80px 20px 60px;}
+.hero h1{font-size:48px;font-weight:900;margin-bottom:16px;background:linear-gradient(135deg,#FF8C5A,#FFD580);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.hero p{font-size:18px;color:#888;max-width:500px;margin:0 auto 32px;}
+.products{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:24px;max-width:900px;margin:0 auto;padding:0 20px 80px;}
+.card{background:#0E0E1A;border:1px solid #1E1E30;border-radius:16px;padding:28px;transition:.2s;}
+.card:hover{border-color:#FF6B3540;transform:translateY(-2px);}
+.card-icon{font-size:36px;margin-bottom:16px;}
+.card h2{font-size:20px;font-weight:800;margin-bottom:8px;color:#F0F0FF;}
+.card p{font-size:14px;color:#666;line-height:1.7;margin-bottom:20px;}
+.card a{display:inline-block;background:linear-gradient(135deg,#FF6B35,#FF2000);color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px;}
+.card a:hover{opacity:.85;}
+.badge{display:inline-block;background:#22C55E22;color:#22C55E;font-size:10px;font-weight:700;padding:3px 8px;border-radius:6px;margin-bottom:12px;}
+footer{background:#0E0E1A;border-top:1px solid #1E1E30;padding:30px 40px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;}
+footer a{color:#555;text-decoration:none;font-size:13px;margin-left:20px;}
+footer a:hover{color:#FF6B35;}
+.copy{color:#333;font-size:13px;}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="logo">⚡ SwiftKit</div>
+  <div class="nav-links">
+    <a href="index.html">Home</a>
+    <a href="pricing.html">Pricing</a>
+    <a href="privacy.html">Privacy</a>
+    <a href="terms.html">Terms</a>
+  </div>
+</nav>
+
+<div class="hero">
+  <h1>⚡ SwiftKit</h1>
+  <p>Powerful Chrome extensions that solve real problems. Built for people who hate wasting time.</p>
+</div>
+
+<div class="products">
+  <div class="card">
+    <div class="badge">✅ LIVE</div>
+    <div class="card-icon">🎯</div>
+    <h2>SlotSniper</h2>
+    <p>Monitors any appointment booking page 24/7 and sends instant WhatsApp alerts the moment a visa, DMV, NHS or passport slot opens.</p>
+    <a href="pricing.html">Get Pro — $29</a>
+  </div>
+  <div class="card">
+    <div class="badge">✅ LIVE</div>
+    <div class="card-icon">⚡</div>
+    <h2>SwiftGrab</h2>
+    <p>IDM-style download manager. Intercepts all browser downloads, grabs YouTube videos, and downloads at maximum speed with 8 parallel connections.</p>
+    <a href="pricing.html">Download Free</a>
+  </div>
+  <div class="card" style="opacity:.5;">
+    <div class="badge" style="background:#6C8EFF22;color:#6C8EFF;">COMING SOON</div>
+    <div class="card-icon">🛡️</div>
+    <h2>SwiftShield</h2>
+    <p>Real-time scam and fake website detector. Know instantly if a site is safe before you enter any information.</p>
+    <a href="#" style="background:#1E1E30;color:#555;cursor:default;">Coming Soon</a>
+  </div>
+</div>
+
+<footer>
+  <span class="copy">© 2026 SwiftKit. All rights reserved.</span>
+  <div>
+    <a href="privacy.html">Privacy Policy</a>
+    <a href="terms.html">Terms of Service</a>
+    <a href="refund.html">Refund Policy</a>
+    <a href="pricing.html">Pricing</a>
+  </div>
+</footer>
+
+</body>
+</html>
