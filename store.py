@@ -65,6 +65,18 @@ class Store:
                     status TEXT NOT NULL,
                     timestamp REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS transfers (
+                    id TEXT PRIMARY KEY,
+                    peer_id TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    bytes_done INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    salt TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_messages_peer ON messages(peer_id);
                 CREATE INDEX IF NOT EXISTS idx_calllog_peer ON call_log(peer_id);
                 CREATE INDEX IF NOT EXISTS idx_files_peer ON files(peer_id);
@@ -207,3 +219,58 @@ class Store:
             }
             for r in rows
         ]
+
+    # -- resumable transfers ------------------------------------------
+    # A transfer is tracked separately from the completed-history "files"
+    # record (add_file_record/get_files above) - this table only holds
+    # in-progress/resumable state; a finished transfer also gets a
+    # permanent files row and can be cleared from here.
+
+    def start_transfer(self, transfer_id, peer_id, direction, filename, path, size, salt_b64):
+        """(Re)initializes a transfer to bytes_done=0. Call only once the
+        caller has already decided this is a fresh attempt, not a resume -
+        the resume-or-fresh decision belongs in the caller (it needs to
+        check the on-disk partial file too, not just this DB row)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO transfers (id, peer_id, direction, filename, path, size, "
+                "bytes_done, status, salt, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, 'in_progress', ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET peer_id=excluded.peer_id, direction=excluded.direction, "
+                "filename=excluded.filename, path=excluded.path, size=excluded.size, bytes_done=0, "
+                "status='in_progress', salt=excluded.salt, updated_at=excluded.updated_at",
+                (transfer_id, peer_id, direction, self._seal(filename), self._seal(path),
+                 size, salt_b64, time.time()),
+            )
+            self._conn.commit()
+
+    def update_transfer_progress(self, transfer_id, bytes_done):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE transfers SET bytes_done=?, updated_at=? WHERE id=?",
+                (bytes_done, time.time(), transfer_id),
+            )
+            self._conn.commit()
+
+    def finish_transfer(self, transfer_id, status):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE transfers SET status=?, updated_at=? WHERE id=?",
+                (status, time.time(), transfer_id),
+            )
+            self._conn.commit()
+
+    def get_transfer(self, transfer_id):
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT peer_id, direction, filename, path, size, bytes_done, status, salt "
+                "FROM transfers WHERE id=?",
+                (transfer_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "peer_id": row[0], "direction": row[1], "filename": self._unseal(row[2]),
+            "path": self._unseal(row[3]), "size": row[4], "bytes_done": row[5],
+            "status": row[6], "salt": row[7],
+        }

@@ -153,6 +153,16 @@ The APK lands in `bin/`.
    python-for-android recipe, but this is the project's first dependency
    with native/Rust build steps, so it's the first thing to check if a
    build fails after this point.
+10. `cryptography`'s Rust build needs a real Rust toolchain, which the
+    `kivy/buildozer` Docker image doesn't ship. Installing it (rustup) as
+    a separate step is safe, but the toolchain then failed to cross-compile
+    the `_openssl` C shim for `armeabi-v7a` (32-bit ARM) specifically:
+    `"LONG_BIT definition appears wrong for platform"`, from `pyport.h`
+    while building against what looks like a mismatched host/target Python
+    header set inside p4a's `hostpython3` build - not something fixable
+    from application code. Fixed by dropping `armeabi-v7a` from
+    `android.archs` (now `arm64-v8a` only, see `buildozer.spec`); all real
+    test hardware for this app is 64-bit, so this isn't a functional loss.
 
 ## Known limitations / open work
 
@@ -180,12 +190,27 @@ The APK lands in `bin/`.
   message aimed at the original peer's name can briefly reach the new
   device instead. Low-probability on a typical home network, but worth
   knowing before relying on this for anything sensitive.
-- **File transfer is unverified on-device.** `ChatScreen.on_send_file` uses
-  `plyer.filechooser`, which on modern Android goes through the system's
-  Storage Access Framework and can return a `content://` URI rather than a
-  plain filesystem path on some Android versions/OEMs - `open(path, "rb")`
-  would fail on that. Needs a real-device test alongside audio; if file
-  sending fails immediately, this is the first thing to check.
+- **File transfer is resumable but unverified on-device.** Large transfers
+  (built for multi-GB files) survive a dropped connection: the receiver
+  tracks progress in the `transfers` table plus an on-disk `.partial` file,
+  and a retry picks up from the last acknowledged byte instead of starting
+  over (each retry attempt still gets its own fresh encryption key/salt, so
+  nothing about resuming weakens the encryption). `ChatScreen` shows a
+  "Retry" button inline in the chat when a send fails. `plyer.filechooser`
+  can return a `content://` URI instead of a plain filesystem path on
+  modern Android (Storage Access Framework) - handled by copying it to a
+  local temp file via `ContentResolver` first
+  (`resolve_android_content_uri` in `main.py`). None of this has run on a
+  real device yet; needs a real-device test alongside audio.
+- **Background operation and notifications are unverified on-device.** The
+  app requests all permissions (including `POST_NOTIFICATIONS`) up front on
+  first launch, asks to be exempted from battery optimization, and posts a
+  system notification (with sound) for incoming messages/calls when not in
+  the foreground - see `android_notify.py`. This is the lighter-weight
+  `on_pause() -> True` approach, not a full Android foreground service (see
+  that file's docstring for the trade-off); very aggressive OEM battery
+  managers (common on some Chinese Android skins) may still kill it in the
+  background regardless.
 - **Encryption is new and unverified on real devices.** It's covered by
   integration tests (two real OS processes talking over loopback,
   simulating two phones) that confirm messages/files decrypt correctly,

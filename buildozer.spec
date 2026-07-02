@@ -26,11 +26,17 @@ fullscreen = 0
 
 icon.filename = %(source.dir)s/assets/icon.png
 
-android.permissions = INTERNET,RECORD_AUDIO,ACCESS_WIFI_STATE,ACCESS_NETWORK_STATE,MODIFY_AUDIO_SETTINGS,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
+android.permissions = INTERNET,RECORD_AUDIO,ACCESS_WIFI_STATE,ACCESS_NETWORK_STATE,MODIFY_AUDIO_SETTINGS,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,POST_NOTIFICATIONS
 
 android.api = 34
 android.minapi = 24
-android.archs = arm64-v8a, armeabi-v7a
+# armeabi-v7a (32-bit) dropped: cryptography's Rust build (_openssl shim)
+# fails cross-compiling for that target specifically ("LONG_BIT definition
+# appears wrong for platform" - a host/target Python header mismatch deep in
+# p4a's hostpython3 build, not something fixable from this project's side).
+# All actual test hardware for this app is 64-bit, so arm64-v8a-only is a
+# pragmatic drop, not a real feature loss.
+android.archs = arm64-v8a
 
 # NDK version p4a recommended after the 25b build failures noted in the
 # project history.

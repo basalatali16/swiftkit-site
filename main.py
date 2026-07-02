@@ -16,6 +16,7 @@ Ports:
 """
 
 import base64
+import hashlib
 import json
 import os
 import socket
@@ -37,6 +38,7 @@ from kivy.uix.popup import Popup
 from kivy.uix.screenmanager import Screen, SlideTransition
 from kivy.utils import platform, escape_markup
 
+import android_notify
 import crypto_util
 from store import Store
 
@@ -119,6 +121,55 @@ def _get_local_ip_via_wifi_manager():
     return socket.inet_ntoa(struct.pack("<I", ip_int))
 
 
+def resolve_android_content_uri(uri_str, dest_dir):
+    """Android's Storage Access Framework file picker (used by
+    plyer.filechooser) commonly returns a content:// URI rather than a
+    plain filesystem path - open(path, "rb") can't read that directly.
+    Copy it via ContentResolver to a real local file first and send that
+    instead. Returns the local path."""
+    from jnius import autoclass
+
+    Uri = autoclass("android.net.Uri")
+    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+    OpenableColumns = autoclass("android.provider.OpenableColumns")
+
+    activity = PythonActivity.mActivity
+    resolver = activity.getContentResolver()
+    uri = Uri.parse(uri_str)
+
+    display_name = "file"
+    cursor = resolver.query(uri, None, None, None, None)
+    if cursor is not None:
+        try:
+            if cursor.moveToFirst():
+                idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if idx >= 0:
+                    name = cursor.getString(idx)
+                    if name:
+                        display_name = name
+        finally:
+            cursor.close()
+
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, os.path.basename(display_name))
+
+    input_stream = resolver.openInputStream(uri)
+    if input_stream is None:
+        raise OSError(f"ContentResolver couldn't open {uri_str}")
+    try:
+        buf = bytearray(65536)
+        with open(dest_path, "wb") as out:
+            while True:
+                n = input_stream.read(buf)
+                if n == -1:
+                    break
+                out.write(bytes(buf[:n]))
+    finally:
+        input_stream.close()
+
+    return dest_path
+
+
 def get_local_ip():
     """Best-effort LAN IP without needing internet access."""
     if platform == "android":
@@ -165,18 +216,43 @@ MAX_MESSAGE_BYTES = 64 * 1024
 PEER_ID_LEN = 16  # crypto_util.peer_id_for_pubkey() hex length
 
 
+def send_encrypted_blob(sock, key, obj):
+    """Encrypt+send one JSON message on an already-open, already-identified
+    connection - no peer-id preamble, since the caller already knows which
+    key to use (either it dialed this peer, or already read the preamble
+    itself). Shared by the signaling/messaging transport and the file
+    transfer's resume-offset handshake."""
+    blob = crypto_util.encrypt(key, json.dumps(obj).encode("utf-8"))
+    sock.sendall(struct.pack("!I", len(blob)) + blob)
+
+
+def recv_encrypted_blob(sock, key):
+    header = recv_exact(sock, 4)
+    if header is None:
+        return None
+    (length,) = struct.unpack("!I", header)
+    if length > MAX_MESSAGE_BYTES:
+        return None
+    blob = recv_exact(sock, length)
+    if blob is None:
+        return None
+    try:
+        plaintext = crypto_util.decrypt(key, blob)
+        return json.loads(plaintext.decode("utf-8"))
+    except Exception:
+        return None
+
+
 def send_encrypted_tcp(ip, port, obj, peer_pubkey_bytes, timeout=4.0):
     """Send one authenticated-encrypted JSON message over a fresh TCP
     connection. Wire format: our 16-byte peer id (plaintext - it's public,
-    just tells the receiver which pubkey to use), then a 4-byte length
-    prefix and the ChaCha20-Poly1305-sealed payload."""
+    just tells the receiver which pubkey to use), then the sealed payload."""
     key = IDENTITY.shared_key_with(peer_pubkey_bytes)
-    blob = crypto_util.encrypt(key, json.dumps(obj).encode("utf-8"))
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
         sock.connect((ip, port))
         sock.sendall(IDENTITY.peer_id.encode("ascii"))
-        sock.sendall(struct.pack("!I", len(blob)) + blob)
+        send_encrypted_blob(sock, key, obj)
 
 
 def recv_encrypted_tcp(conn, pubkey_lookup_fn):
@@ -198,21 +274,9 @@ def recv_encrypted_tcp(conn, pubkey_lookup_fn):
     except Exception:
         return None
 
-    header = recv_exact(conn, 4)
-    if header is None:
-        return None
-    (length,) = struct.unpack("!I", header)
-    if length > MAX_MESSAGE_BYTES:
-        return None
-    blob = recv_exact(conn, length)
-    if blob is None:
-        return None
-
     key = IDENTITY.shared_key_with(peer_pubkey)
-    try:
-        plaintext = crypto_util.decrypt(key, blob)
-        obj = json.loads(plaintext.decode("utf-8"))
-    except Exception:
+    obj = recv_encrypted_blob(conn, key)
+    if obj is None:
         return None
     obj["_sender_id"] = sender_id
     return obj
@@ -922,13 +986,30 @@ class CallManager:
 # ---------------------------------------------------------------------------
 
 class FileTransferManager:
-    """Sends/receives arbitrary files over a dedicated TCP port. An
-    encrypted+authenticated JSON header announces the filename, size, and a
-    random per-transfer salt; the file body is streamed as fixed-size
-    chunks, each independently encrypted (ChaCha20-Poly1305) with a key
-    derived from that salt and a counter nonce - safe because the salt (and
-    therefore the key) is fresh every transfer, so a restarting counter
-    never repeats under the same key."""
+    """Sends/receives arbitrary files over a dedicated TCP port, resumable
+    from a connection drop - built for GB-scale transfers where restarting
+    from zero after a WiFi hiccup isn't acceptable.
+
+    Protocol per attempt:
+      1. Sender connects, sends an encrypted FILE_META header (filename,
+         size, a stable transfer_id, and a fresh per-attempt salt).
+      2. Receiver looks up transfer_id in its local `transfers` table. If a
+         resumable partial file exists with a byte count that actually
+         matches what's on disk, it acks that offset; otherwise it acks 0
+         and (re)starts the transfer record. The receiver's on-disk state
+         is the single source of truth for where to resume, not whatever
+         the sender remembers locally.
+      3. Sender seeks to that offset and streams the remaining bytes as
+         chunks, each independently encrypted (ChaCha20-Poly1305, counter
+         nonce restarting at 0 for *this attempt's* chunks - safe because
+         each attempt gets its own fresh salt/key, so key reuse across
+         attempts never happens).
+      4. Progress is checkpointed to the DB periodically so a resume is
+         possible even if the app itself restarts mid-transfer, not just on
+         a transient network drop.
+    """
+
+    PROGRESS_CHECKPOINT_CHUNKS = 16  # ~1MB at the 64KB chunk size
 
     def __init__(self, display_name, store, files_dir, on_event):
         self.display_name = display_name
@@ -960,15 +1041,19 @@ class FileTransferManager:
             threading.Thread(target=self._handle_incoming, args=(conn, addr), daemon=True).start()
         sock.close()
 
+    @staticmethod
+    def transfer_id_for(peer_id, filename, size):
+        return hashlib.sha256(f"{peer_id}:{filename}:{size}".encode("utf-8")).hexdigest()[:16]
+
     def _unique_path(self, filename):
         path = os.path.join(self.files_dir, filename)
-        if not os.path.exists(path):
+        if not os.path.exists(path) and not os.path.exists(path + ".partial"):
             return path
         base, ext = os.path.splitext(filename)
         n = 1
         while True:
             candidate = os.path.join(self.files_dir, f"{base} ({n}){ext}")
-            if not os.path.exists(candidate):
+            if not os.path.exists(candidate) and not os.path.exists(candidate + ".partial"):
                 return candidate
             n += 1
 
@@ -984,26 +1069,55 @@ class FileTransferManager:
             peer_name = header.get("from_name", "Unknown")
             filename = os.path.basename(header.get("filename") or "file")
             size = int(header.get("size") or 0)
+            transfer_id = header.get("transfer_id") or self.transfer_id_for(peer_id, filename, size)
 
             pubkey_b64 = self.store.get_peer_pubkey(peer_id)
             try:
                 transfer_salt = base64.b64decode(header.get("salt", ""))
             except Exception:
                 transfer_salt = b""
-            if not pubkey_b64 or not transfer_salt:
+            if not pubkey_b64 or not transfer_salt or size <= 0:
                 return
-            file_key = IDENTITY.shared_key_with(base64.b64decode(pubkey_b64),
-                                                 context=b"lancom-file:" + transfer_salt)
+            peer_pubkey = base64.b64decode(pubkey_b64)
+            file_key = IDENTITY.shared_key_with(peer_pubkey, context=b"lancom-file:" + transfer_salt)
+            header_key = IDENTITY.shared_key_with(peer_pubkey)
 
             os.makedirs(self.files_dir, exist_ok=True)
-            dest_path = self._unique_path(filename)
 
-            received = 0
+            existing = self.store.get_transfer(transfer_id)
+            dest_path = None
+            offset = 0
+            if (existing and existing["status"] == "in_progress" and existing["size"] == size
+                    and existing["direction"] == "in"):
+                candidate = existing["path"]
+                if os.path.exists(candidate) and os.path.getsize(candidate) == existing["bytes_done"]:
+                    dest_path = candidate
+                    offset = existing["bytes_done"]
+
+            if dest_path is None:
+                dest_path = self._unique_path(filename) + ".partial"
+                offset = 0
+                self.store.start_transfer(transfer_id, peer_id, "in", filename, dest_path,
+                                           size, header.get("salt", ""))
+
+            try:
+                send_encrypted_blob(conn, header_key, {"type": "FILE_RESUME_ACK", "offset": offset})
+            except OSError:
+                return
+
+            if offset >= size:
+                # Already had the whole thing (e.g. a duplicate resume
+                # attempt racing a completion) - nothing left to receive.
+                self._finish_incoming(transfer_id, peer_id, peer_name, filename, size, dest_path, "completed")
+                return
+
+            received = offset
             chunk_index = 0
             status = "failed"
             try:
                 conn.settimeout(30.0)
-                with open(dest_path, "wb") as f:
+                with open(dest_path, "r+b" if offset else "wb") as f:
+                    f.seek(offset)
                     while received < size:
                         plain_len = min(FILE_CHUNK, size - received)
                         blob = recv_exact(conn, plain_len + FILE_TAG_LEN)
@@ -1014,21 +1128,51 @@ class FileTransferManager:
                         f.write(plaintext)
                         received += len(plaintext)
                         chunk_index += 1
+                        if chunk_index % self.PROGRESS_CHECKPOINT_CHUNKS == 0:
+                            self.store.update_transfer_progress(transfer_id, received)
                 if received == size:
                     status = "completed"
             except OSError:
+                # Connection dropped - keep the partial file and DB progress
+                # as-is so a later attempt with the same transfer_id resumes
+                # from here instead of restarting.
                 status = "failed"
             except Exception:
-                # tampered/undecryptable chunk - abort, don't keep a
-                # partially-decrypted file that silently looks complete
-                status = "failed"
+                # Tampered/undecryptable chunk - this attempt is unsafe to
+                # resume from (we don't know how much of what's on disk is
+                # trustworthy), so drop the whole transfer rather than risk
+                # silently keeping corrupted bytes.
+                status = "corrupt"
 
-            self.store.add_file_record(peer_id, peer_name, "in", filename, size, dest_path, status)
-            self.on_event({"event": "file_received", "peer_id": peer_id, "peer_name": peer_name,
-                            "filename": filename, "size": size, "status": status})
+            if status == "corrupt":
+                try:
+                    os.remove(dest_path)
+                except OSError:
+                    pass
+                self.store.finish_transfer(transfer_id, "failed")
+                self.on_event({"event": "file_received", "peer_id": peer_id, "peer_name": peer_name,
+                                "filename": filename, "size": size, "status": "failed"})
+                return
+
+            self.store.update_transfer_progress(transfer_id, received)
+            self._finish_incoming(transfer_id, peer_id, peer_name, filename, size, dest_path, status)
+
+    def _finish_incoming(self, transfer_id, peer_id, peer_name, filename, size, dest_path, status):
+        if status == "completed":
+            final_path = dest_path[:-len(".partial")] if dest_path.endswith(".partial") else dest_path
+            try:
+                os.replace(dest_path, final_path)
+            except OSError:
+                final_path = dest_path
+            self.store.finish_transfer(transfer_id, "completed")
+            self.store.add_file_record(peer_id, peer_name, "in", filename, size, final_path, "completed")
+        self.on_event({"event": "file_received", "peer_id": peer_id, "peer_name": peer_name,
+                        "filename": filename, "size": size, "status": status})
 
     def send_file(self, peer_id, peer_name, peer_ip, file_path):
-        """Blocking - call from a background thread."""
+        """Blocking - call from a background thread. Safe to call again
+        with the same (peer, filename, size) after a failure: it'll ask the
+        receiver where to resume from rather than starting over."""
         filename = os.path.basename(file_path)
         pubkey_b64 = self.store.get_peer_pubkey(peer_id)
         try:
@@ -1041,27 +1185,36 @@ class FileTransferManager:
                             "filename": filename, "size": size, "status": "failed"})
             return
 
+        transfer_id = self.transfer_id_for(peer_id, filename, size)
         peer_pubkey = base64.b64decode(pubkey_b64)
         transfer_salt = os.urandom(16)
         file_key = IDENTITY.shared_key_with(peer_pubkey, context=b"lancom-file:" + transfer_salt)
         header_key = IDENTITY.shared_key_with(peer_pubkey)
-        header_blob = crypto_util.encrypt(header_key, json.dumps({
-            "type": "FILE_META", "filename": filename, "size": size,
-            "from_name": self.display_name,
-            "salt": base64.b64encode(transfer_salt).decode("ascii"),
-        }).encode("utf-8"))
+        self.store.start_transfer(transfer_id, peer_id, "out", filename, file_path,
+                                   size, base64.b64encode(transfer_salt).decode("ascii"))
 
         status = "failed"
+        sent_total = 0
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(10.0)
                 sock.connect((peer_ip, FILE_PORT))
                 sock.sendall(IDENTITY.peer_id.encode("ascii"))
-                sock.sendall(struct.pack("!I", len(header_blob)) + header_blob)
+                send_encrypted_blob(sock, header_key, {
+                    "type": "FILE_META", "filename": filename, "size": size,
+                    "from_name": self.display_name, "transfer_id": transfer_id,
+                    "salt": base64.b64encode(transfer_salt).decode("ascii"),
+                })
 
-                sock.settimeout(30.0)
+                sock.settimeout(15.0)
+                ack = recv_encrypted_blob(sock, header_key)
+                offset = min(int(ack.get("offset", 0)), size) if ack else 0
+                sent_total = offset
+
+                sock.settimeout(60.0)
                 chunk_index = 0
                 with open(file_path, "rb") as f:
+                    f.seek(offset)
                     while True:
                         chunk = f.read(FILE_CHUNK)
                         if not chunk:
@@ -1070,14 +1223,22 @@ class FileTransferManager:
                         encrypted = crypto_util.encrypt_with_nonce(file_key, nonce, chunk)
                         sock.sendall(encrypted)
                         chunk_index += 1
+                        sent_total += len(chunk)
+                        if chunk_index % self.PROGRESS_CHECKPOINT_CHUNKS == 0:
+                            self.store.update_transfer_progress(transfer_id, sent_total)
             status = "completed"
         except OSError:
             status = "failed"
 
-        self.store.add_file_record(peer_id, peer_name, "out", filename, size, file_path, status)
+        self.store.update_transfer_progress(transfer_id, sent_total)
+        if status == "completed":
+            self.store.finish_transfer(transfer_id, "completed")
+            self.store.add_file_record(peer_id, peer_name, "out", filename, size, file_path, "completed")
+
         self.on_event({"event": "file_sent" if status == "completed" else "file_send_failed",
                         "peer_id": peer_id, "peer_name": peer_name,
-                        "filename": filename, "size": size, "status": status})
+                        "filename": filename, "size": size, "status": status,
+                        "transfer_id": transfer_id, "path": file_path})
 
 
 # ---------------------------------------------------------------------------
@@ -1483,15 +1644,22 @@ class ChatBubble(BoxLayout):
 
 class ChatEvent(BoxLayout):
     """A muted, centered line for call/file history entries interleaved
-    with messages - e.g. 'Missed call', 'Sent report.pdf (2.4 MB)'."""
+    with messages - e.g. 'Missed call', 'Sent report.pdf (2.4 MB)'. Pass
+    on_retry for a failed transfer to show a Retry button under it."""
 
-    def __init__(self, text, **kwargs):
-        super().__init__(orientation="vertical", size_hint_y=None, **kwargs)
+    def __init__(self, text, on_retry=None, **kwargs):
+        super().__init__(orientation="vertical", size_hint_y=None, spacing=dp(4), **kwargs)
         label = Label(text=escape_markup(text), font_size=dp(12),
                       color=(0.55, 0.55, 0.6, 1), size_hint_y=None, halign="center")
         label.bind(texture_size=lambda inst, val: setattr(label, "height", val[1] + 6))
         label.bind(width=lambda inst, val: setattr(label, "text_size", (val, None)))
         self.add_widget(label)
+        if on_retry:
+            retry_btn = Button(text="Retry", size_hint=(None, None), size=(dp(70), dp(28)),
+                                background_normal="", background_color=(0.83, 0.69, 0.42, 1),
+                                color=(0.05, 0.06, 0.1, 1), font_size=dp(11), bold=True)
+            retry_btn.bind(on_release=lambda *_: on_retry())
+            self.add_widget(retry_btn)
         self.bind(minimum_height=self.setter("height"))
 
 
@@ -1595,6 +1763,15 @@ class ChatScreen(Screen):
     def _start_file_send(self, path):
         app = App.get_running_app()
         peer = self.peer
+
+        if path.startswith("content://"):
+            try:
+                local_dir = os.path.join(app.user_data_dir, "outgoing_tmp")
+                path = resolve_android_content_uri(path, local_dir)
+            except Exception:
+                self.append_event("Couldn't read that file - try picking it again")
+                return
+
         self.append_event(f"Sending {os.path.basename(path)}…")
 
         def do_send():
@@ -1611,8 +1788,8 @@ class ChatScreen(Screen):
         self.ids.message_list.add_widget(bubble)
         Clock.schedule_once(lambda dt: setattr(self.ids.chat_scroll, "scroll_y", 0), 0.05)
 
-    def append_event(self, text):
-        self.ids.message_list.add_widget(ChatEvent(text))
+    def append_event(self, text, on_retry=None):
+        self.ids.message_list.add_widget(ChatEvent(text, on_retry=on_retry))
         Clock.schedule_once(lambda dt: setattr(self.ids.chat_scroll, "scroll_y", 0), 0.05)
 
     def receive_message(self, msg):
@@ -1625,7 +1802,10 @@ class ChatScreen(Screen):
         direction = "in" if event["event"] == "file_received" else "out"
         row = {"direction": direction, "filename": event["filename"],
                "size": event.get("size", 0), "status": event.get("status", "failed")}
-        self.append_event(self._file_log_text(row))
+        on_retry = None
+        if event["event"] == "file_send_failed" and event.get("path"):
+            on_retry = lambda: self._start_file_send(event["path"])
+        self.append_event(self._file_log_text(row), on_retry=on_retry)
 
     @staticmethod
     def _call_log_text(c):
@@ -1715,6 +1895,7 @@ class LancomApp(App):
         self.message_server = None
         self.call_manager = None
         self.file_manager = None
+        self._is_foreground = True
         self.profile_store = JsonStore(self.user_data_dir + "/lancom.json")
 
         IDENTITY = crypto_util.Identity.load_or_create(
@@ -1735,9 +1916,13 @@ class LancomApp(App):
                     Permission.INTERNET,
                     Permission.READ_EXTERNAL_STORAGE,
                     Permission.WRITE_EXTERNAL_STORAGE,
+                    Permission.POST_NOTIFICATIONS,
                 ])
             except Exception:
                 pass
+            # Not a runtime permission - a separate system settings prompt,
+            # so it's requested after the batch above rather than mixed in.
+            Clock.schedule_once(lambda dt: android_notify.request_ignore_battery_optimizations(), 1.5)
 
         if self.profile_store.exists("profile"):
             name = self.profile_store.get("profile").get("name", "")
@@ -1746,6 +1931,20 @@ class LancomApp(App):
                 self.root.current = "users"
                 return
         self.root.current = "setup"
+
+    def on_pause(self):
+        # Returning True tells Android this app may keep running in the
+        # background instead of being torn down, so discovery/messaging/
+        # calls keep working while LANCOM isn't the foreground app. Some
+        # OEM battery managers ignore this and kill it anyway - the
+        # ignore-battery-optimizations prompt in on_start is the mitigation
+        # for that; a full foreground service would be the next step up if
+        # that's still not enough on-device.
+        self._is_foreground = False
+        return True
+
+    def on_resume(self):
+        self._is_foreground = True
 
     def set_display_name(self, name):
         self.display_name = name
@@ -1769,7 +1968,11 @@ class LancomApp(App):
 
     def _dispatch_message(self, msg):
         chat = self.root.get_screen("chat")
+        viewing_this_chat = (self.root.current == "chat" and chat.peer
+                              and chat.peer.get("id") == msg.get("from_id"))
         chat.receive_message(msg)
+        if not viewing_this_chat or not self._is_foreground:
+            android_notify.notify_message(msg.get("from_name", "Unknown"), msg.get("text", ""))
 
     def _on_call_event(self, event):
         Clock.schedule_once(lambda dt: self._dispatch_call_event(event), 0)
@@ -1781,6 +1984,8 @@ class LancomApp(App):
             call_screen.on_incoming(event["peer_name"])
             self.root.transition = SlideTransition(direction="up")
             self.root.current = "call"
+            if not self._is_foreground:
+                android_notify.notify_incoming_call(event["peer_name"])
         elif kind == "call_active":
             call_screen.on_active(event["peer_name"])
         elif kind == "call_rejected":
