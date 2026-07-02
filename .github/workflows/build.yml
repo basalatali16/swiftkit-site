@@ -36,35 +36,55 @@ jobs:
             ~/.cargo-cache
           key: rust-toolchain-${{ runner.os }}
 
+      # kivy/buildozer's entrypoint.sh dynamically maps the container user to
+      # the host UID/GID (chown -R on /home/user) and runs buildozer via
+      # `sudo --preserve-env --user <mapped> ... -- buildozer "$@"` - it does
+      # NOT accept arbitrary commands, only buildozer's own args. Overriding
+      # --entrypoint to inject a "install rust first" step skips that whole
+      # mechanism, so buildozer ends up running as literal root (crashes on
+      # its own interactive root-check prompt in non-interactive CI) - that's
+      # exactly what broke the previous attempt at this fix.
+      #
+      # Instead: install Rust in a separate step that overrides the
+      # entrypoint (safe here since this step never runs buildozer, so the
+      # user-mapping/root-check concerns don't apply - and entrypoint.sh's
+      # chown -R on the next step fixes ownership regardless of which UID
+      # wrote these files). Then run the *unmodified* entrypoint for the
+      # actual build, adding cargo's bin dir to PATH via `docker run -e` so
+      # entrypoint.sh's own `PATH="$HOME/.venv/bin:$PATH"` picks it up.
+      - name: Install Rust toolchain for cryptography's build
+        run: |
+          mkdir -p ~/.rustup-cache ~/.cargo-cache
+          docker run --rm \
+            --volume "$HOME/.rustup-cache":/home/user/.rustup \
+            --volume "$HOME/.cargo-cache":/home/user/.cargo \
+            --entrypoint bash \
+            kivy/buildozer:latest \
+            -c '
+              if [ ! -x /home/user/.cargo/bin/rustc ]; then
+                apt-get update -qq
+                apt-get install -y -qq curl
+                export HOME=/home/user
+                curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+              fi
+            '
+
       # Runs the official kivy/buildozer Docker image directly rather than
       # going through a third-party wrapper action - a prior run showed
       # ArtemSBulgakov/buildozer-action@v1 building its own Dockerfile on
       # top of that image (to add a newer JDK via the openjdk-r PPA), and
       # that PPA 404s against current ubuntu-latest runners. The kivy/buildozer
       # image already ships a working JDK, so no extra layer is needed.
-      #
-      # The entrypoint is overridden to install rustup first (kivy/buildozer
-      # doesn't ship Rust) - cryptography's build needs `rustc`/`cargo` on
-      # PATH. Installed into the same mounted-cache pattern as the buildozer
-      # packages dir so it's not reinstalled from scratch every run.
       - name: Build APK with buildozer
         run: |
-          mkdir -p ~/.buildozer-global-cache ~/.rustup-cache ~/.cargo-cache
+          mkdir -p ~/.buildozer-global-cache
           docker run --rm \
             --volume "${{ github.workspace }}":/home/user/hostcwd \
             --volume "$HOME/.buildozer-global-cache":/home/user/.buildozer \
             --volume "$HOME/.rustup-cache":/home/user/.rustup \
             --volume "$HOME/.cargo-cache":/home/user/.cargo \
-            --entrypoint bash \
-            kivy/buildozer:latest \
-            -c '
-              cd /home/user/hostcwd
-              if ! command -v rustup >/dev/null 2>&1; then
-                curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-              fi
-              source "$HOME/.cargo/env"
-              buildozer android debug
-            '
+            --env PATH="/home/user/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            kivy/buildozer:latest android debug
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
