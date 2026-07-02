@@ -24,19 +24,47 @@ jobs:
           path: ~/.buildozer-global-cache
           key: buildozer-global-${{ hashFiles('buildozer.spec') }}
 
+      # cryptography (added for end-to-end encryption) compiles a Rust
+      # extension - there's no prebuilt wheel for Android, so p4a builds it
+      # from source, which needs a real Rust toolchain. Cached across runs
+      # the same way as the buildozer packages cache below.
+      - name: Cache Rust toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup-cache
+            ~/.cargo-cache
+          key: rust-toolchain-${{ runner.os }}
+
       # Runs the official kivy/buildozer Docker image directly rather than
       # going through a third-party wrapper action - a prior run showed
       # ArtemSBulgakov/buildozer-action@v1 building its own Dockerfile on
       # top of that image (to add a newer JDK via the openjdk-r PPA), and
       # that PPA 404s against current ubuntu-latest runners. The kivy/buildozer
       # image already ships a working JDK, so no extra layer is needed.
+      #
+      # The entrypoint is overridden to install rustup first (kivy/buildozer
+      # doesn't ship Rust) - cryptography's build needs `rustc`/`cargo` on
+      # PATH. Installed into the same mounted-cache pattern as the buildozer
+      # packages dir so it's not reinstalled from scratch every run.
       - name: Build APK with buildozer
         run: |
-          mkdir -p ~/.buildozer-global-cache
+          mkdir -p ~/.buildozer-global-cache ~/.rustup-cache ~/.cargo-cache
           docker run --rm \
             --volume "${{ github.workspace }}":/home/user/hostcwd \
             --volume "$HOME/.buildozer-global-cache":/home/user/.buildozer \
-            kivy/buildozer:latest android debug
+            --volume "$HOME/.rustup-cache":/home/user/.rustup \
+            --volume "$HOME/.cargo-cache":/home/user/.cargo \
+            --entrypoint bash \
+            kivy/buildozer:latest \
+            -c '
+              cd /home/user/hostcwd
+              if ! command -v rustup >/dev/null 2>&1; then
+                curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+              fi
+              source "$HOME/.cargo/env"
+              buildozer android debug
+            '
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
