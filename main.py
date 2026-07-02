@@ -747,6 +747,14 @@ ScreenManager:
                 halign: "left"
                 text_size: self.size
 
+        Label:
+            id: debug_info
+            text: ""
+            font_size: dp(11)
+            color: 0.45, 0.45, 0.5, 1
+            size_hint_y: None
+            height: dp(18)
+
         ScrollView:
             BoxLayout:
                 id: peer_list
@@ -907,6 +915,10 @@ class UsersScreen(Screen):
         app = App.get_running_app()
         if not app.discovery:
             return
+        self.ids.debug_info.text = (
+            f"This device: {app.discovery.local_ip}  "
+            f"|  broadcasting to: {app.discovery.broadcast_ip}"
+        )
         peers = app.discovery.get_peers()
         container = self.ids.peer_list
         container.clear_widgets()
