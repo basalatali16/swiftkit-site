@@ -14,7 +14,12 @@ version = 0.1
 # python3 downward to chase Kivy 2.3.0 caused a hostpython3/python3 version
 # mismatch (see project README "Build history"); upgrading Kivy instead
 # avoids fighting p4a's default toolchain.
-requirements = python3,kivy==2.3.1,pyjnius,android,plyer,sqlite3
+# cryptography has an actively-maintained p4a recipe (Rust + OpenSSL
+# bindings) - used for the X25519/ChaCha20-Poly1305 end-to-end encryption
+# layer. This is the first time this project has added a dependency with
+# native/Rust build steps; if it fails in CI, that's the first thing to
+# check (see README "Build history").
+requirements = python3,kivy==2.3.1,pyjnius,android,plyer,sqlite3,cryptography
 
 orientation = portrait
 fullscreen = 0

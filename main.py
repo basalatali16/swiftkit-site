@@ -15,13 +15,13 @@ Ports:
   55559/TCP - file transfer
 """
 
+import base64
 import json
 import os
 import socket
 import struct
 import threading
 import time
-import uuid
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -33,9 +33,11 @@ from kivy.storage.jsonstore import JsonStore
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
+from kivy.uix.popup import Popup
 from kivy.uix.screenmanager import Screen, SlideTransition
 from kivy.utils import platform, escape_markup
 
+import crypto_util
 from store import Store
 
 BROADCAST_PORT = 55555
@@ -47,8 +49,13 @@ FILE_PORT = 55559
 BROADCAST_INTERVAL = 2.0
 PEER_TIMEOUT = 7.0
 FILE_CHUNK = 65536
+FILE_TAG_LEN = 16  # ChaCha20-Poly1305 auth tag length appended to each chunk
 
-DEVICE_ID = uuid.uuid4().hex[:12]
+# Set once by LancomApp.build() before any networking starts. Every
+# device's id is derived from this identity's public key (see
+# crypto_util.peer_id_for_pubkey) - it can't be spoofed without also
+# having the matching private key.
+IDENTITY = None
 
 # "Luxury" palette - deep navy background, warm gold accent.
 COLOR_BG = (0.035, 0.043, 0.078, 1)
@@ -144,15 +151,6 @@ def get_broadcast_ip(local_ip):
     return "255.255.255.255"
 
 
-def send_json_tcp(ip, port, obj, timeout=4.0):
-    """Send one length-prefixed JSON message over a fresh TCP connection."""
-    data = json.dumps(obj).encode("utf-8")
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        sock.connect((ip, port))
-        sock.sendall(struct.pack("!I", len(data)) + data)
-
-
 def recv_exact(sock, n):
     buf = bytearray()
     while len(buf) < n:
@@ -164,19 +162,60 @@ def recv_exact(sock, n):
 
 
 MAX_MESSAGE_BYTES = 64 * 1024
+PEER_ID_LEN = 16  # crypto_util.peer_id_for_pubkey() hex length
 
 
-def recv_json_tcp(conn):
+def send_encrypted_tcp(ip, port, obj, peer_pubkey_bytes, timeout=4.0):
+    """Send one authenticated-encrypted JSON message over a fresh TCP
+    connection. Wire format: our 16-byte peer id (plaintext - it's public,
+    just tells the receiver which pubkey to use), then a 4-byte length
+    prefix and the ChaCha20-Poly1305-sealed payload."""
+    key = IDENTITY.shared_key_with(peer_pubkey_bytes)
+    blob = crypto_util.encrypt(key, json.dumps(obj).encode("utf-8"))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect((ip, port))
+        sock.sendall(IDENTITY.peer_id.encode("ascii"))
+        sock.sendall(struct.pack("!I", len(blob)) + blob)
+
+
+def recv_encrypted_tcp(conn, pubkey_lookup_fn):
+    """Reads the peer-id preamble, looks up that peer's stored public key,
+    derives the shared key, and decrypts. Returns None on any failure
+    (unknown peer, tampered/wrong-key ciphertext, truncated read) - there
+    is no plaintext fallback. The returned dict's "_sender_id" is
+    cryptographically authenticated: forging it would derive the wrong
+    key and decryption would fail."""
+    sender_id_bytes = recv_exact(conn, PEER_ID_LEN)
+    if sender_id_bytes is None:
+        return None
+    sender_id = sender_id_bytes.decode("ascii", errors="replace")
+    pubkey_b64 = pubkey_lookup_fn(sender_id)
+    if not pubkey_b64:
+        return None
+    try:
+        peer_pubkey = base64.b64decode(pubkey_b64)
+    except Exception:
+        return None
+
     header = recv_exact(conn, 4)
     if header is None:
         return None
     (length,) = struct.unpack("!I", header)
     if length > MAX_MESSAGE_BYTES:
         return None
-    payload = recv_exact(conn, length)
-    if payload is None:
+    blob = recv_exact(conn, length)
+    if blob is None:
         return None
-    return json.loads(payload.decode("utf-8"))
+
+    key = IDENTITY.shared_key_with(peer_pubkey)
+    try:
+        plaintext = crypto_util.decrypt(key, blob)
+        obj = json.loads(plaintext.decode("utf-8"))
+    except Exception:
+        return None
+    obj["_sender_id"] = sender_id
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -397,8 +436,9 @@ class PeerDiscovery:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         payload = {
             "type": "LANCOM_HELLO",
-            "id": DEVICE_ID,
+            "id": IDENTITY.peer_id,
             "name": self.display_name,
+            "pubkey": base64.b64encode(IDENTITY.public_bytes).decode("ascii"),
         }
         data = json.dumps(payload).encode("utf-8")
         while self._running:
@@ -431,7 +471,17 @@ class PeerDiscovery:
                 continue
             if msg.get("type") != "LANCOM_HELLO":
                 continue
-            if msg.get("id") == DEVICE_ID:
+            if msg.get("id") == IDENTITY.peer_id:
+                continue
+            pubkey_b64 = msg.get("pubkey")
+            try:
+                pubkey_bytes = base64.b64decode(pubkey_b64) if pubkey_b64 else b""
+            except Exception:
+                continue
+            # The id must actually be derived from the claimed pubkey -
+            # otherwise anyone could broadcast a HELLO claiming to be an
+            # id they don't hold the private key for.
+            if not pubkey_bytes or crypto_util.peer_id_for_pubkey(pubkey_bytes) != msg.get("id"):
                 continue
             peer_id = msg["id"]
             name = msg.get("name", "Unknown")
@@ -440,9 +490,10 @@ class PeerDiscovery:
                     "id": peer_id,
                     "name": name,
                     "ip": addr[0],
+                    "pubkey": pubkey_b64,
                     "last_seen": time.time(),
                 }
-            self.store.upsert_peer(peer_id, name, addr[0])
+            self.store.upsert_peer(peer_id, name, addr[0], pubkey_b64)
         sock.close()
 
     def _reap_loop(self):
@@ -466,13 +517,16 @@ class PeerDiscovery:
             live_info = live.get(p["id"])
             if live_info:
                 result.append({"id": p["id"], "name": live_info["name"], "ip": live_info["ip"],
+                                "pubkey": live_info["pubkey"],
                                 "online": True, "last_seen": live_info["last_seen"]})
             else:
                 result.append({"id": p["id"], "name": p["name"], "ip": p["ip"],
+                                "pubkey": p["pubkey"],
                                 "online": False, "last_seen": p["last_seen"]})
         for pid, info in live.items():
             if pid not in seen_ids:
                 result.append({"id": pid, "name": info["name"], "ip": info["ip"],
+                                "pubkey": info["pubkey"],
                                 "online": True, "last_seen": info["last_seen"]})
         result.sort(key=lambda p: (not p["online"], p["name"].lower()))
         return result
@@ -515,27 +569,32 @@ class MessageServer:
     def _handle_conn(self, conn, addr):
         with conn:
             try:
-                msg = recv_json_tcp(conn)
+                msg = recv_encrypted_tcp(conn, self.store.get_peer_pubkey)
             except OSError:
                 return
             if not msg:
                 return
             msg["ip"] = addr[0]
-            self.store.add_message(msg.get("from_id", "unknown"),
-                                    msg.get("from_name", "Unknown"),
+            # _sender_id is authenticated by successful decryption - trust
+            # it over any from_id the JSON body itself might claim.
+            sender_id = msg["_sender_id"]
+            self.store.add_message(sender_id, msg.get("from_name", "Unknown"),
                                     "in", msg.get("text", ""))
+            msg["from_id"] = sender_id
             self.on_message(msg)
 
     def send_message(self, peer_id, peer_name, peer_ip, text):
+        pubkey_b64 = self.store.get_peer_pubkey(peer_id)
+        if not pubkey_b64:
+            raise OSError(f"no known public key for peer {peer_id}")
         self.store.add_message(peer_id, peer_name, "out", text)
         payload = {
             "type": "MSG",
-            "from_id": DEVICE_ID,
             "from_name": self.display_name,
             "text": text,
             "timestamp": time.time(),
         }
-        send_json_tcp(peer_ip, MESSAGE_PORT, payload)
+        send_encrypted_tcp(peer_ip, MESSAGE_PORT, payload, base64.b64decode(pubkey_b64))
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +616,8 @@ class CallManager:
         self.state = "idle"  # idle | calling | ringing | active
         self._direction = None  # "in" | "out"
         self._call_start = None
+        self._call_salt = None  # random per-call salt -> distinct audio key per call
+        self._call_key = None
         self.audio = None
         self._audio_send_sock = None
         self._audio_recv_thread = None
@@ -595,6 +656,8 @@ class CallManager:
         self.peer_name = None
         self._direction = None
         self._call_start = None
+        self._call_salt = None
+        self._call_key = None
 
     def _log_call(self, peer_id, peer_name, direction, outcome):
         duration = (time.time() - self._call_start) if self._call_start else 0.0
@@ -604,38 +667,51 @@ class CallManager:
     def _handle_signal(self, conn, addr):
         with conn:
             try:
-                msg = recv_json_tcp(conn)
+                msg = recv_encrypted_tcp(conn, self.store.get_peer_pubkey)
             except OSError:
                 return
             if not msg:
                 return
             msg_type = msg.get("type")
+            sender_id = msg["_sender_id"]
 
             if msg_type == "INVITE":
                 with self._lock:
                     busy = self.state != "idle"
                     if not busy:
-                        self.peer_id = msg.get("from_id")
+                        self.peer_id = sender_id
                         self.peer_ip = addr[0]
                         self.peer_name = msg.get("from_name", "Unknown")
                         self.state = "ringing"
                         self._direction = "in"
                         self._call_start = None
+                        try:
+                            self._call_salt = base64.b64decode(msg.get("call_salt", ""))
+                        except Exception:
+                            self._call_salt = None
                 if busy:
-                    try:
-                        send_json_tcp(addr[0], CALL_SIGNAL_PORT,
-                                      {"type": "REJECT", "from_id": DEVICE_ID, "reason": "busy"})
-                    except OSError:
-                        pass
+                    pubkey_b64 = self.store.get_peer_pubkey(sender_id)
+                    if pubkey_b64:
+                        try:
+                            send_encrypted_tcp(addr[0], CALL_SIGNAL_PORT, {"type": "REJECT", "reason": "busy"},
+                                                base64.b64decode(pubkey_b64))
+                        except OSError:
+                            pass
+                    return
+                if not self._call_salt:
+                    with self._lock:
+                        self._reset_to_idle()
                     return
                 self.on_event({"event": "incoming_call", "peer_name": self.peer_name, "peer_ip": self.peer_ip})
                 return
 
             # ACCEPT/REJECT/HANGUP only apply to messages from the peer we're
-            # actually talking to - otherwise any other device on the LAN
-            # could hijack or end a call in progress.
+            # actually talking to. sender_id is cryptographically
+            # authenticated (forging it would derive the wrong decryption
+            # key), unlike the IP-based check this used to rely on, which a
+            # device on the same LAN could spoof.
             with self._lock:
-                from_current_peer = self.peer_ip is not None and addr[0] == self.peer_ip
+                from_current_peer = self.peer_id is not None and sender_id == self.peer_id
                 peer_id, peer_name, direction = self.peer_id, self.peer_name, self._direction
                 if msg_type == "ACCEPT" and from_current_peer and self.state == "calling":
                     self.state = "active"
@@ -665,10 +741,13 @@ class CallManager:
 
     # -- outgoing actions ---------------------------------------------------
     # Signaling sends run on a background thread so button presses never
-    # block the Kivy UI thread on a slow/dead peer (send_json_tcp has up to
-    # a 4s connect timeout).
+    # block the Kivy UI thread on a slow/dead peer (send_encrypted_tcp has
+    # up to a 4s connect timeout).
 
     def call(self, peer_id, peer_ip, peer_name):
+        pubkey_b64 = self.store.get_peer_pubkey(peer_id)
+        if not pubkey_b64:
+            return False
         with self._lock:
             if self.state != "idle":
                 return False
@@ -678,11 +757,15 @@ class CallManager:
             self.state = "calling"
             self._direction = "out"
             self._call_start = None
+            self._call_salt = os.urandom(16)
+            call_salt = self._call_salt
 
         def send_invite():
             try:
-                send_json_tcp(peer_ip, CALL_SIGNAL_PORT,
-                              {"type": "INVITE", "from_id": DEVICE_ID, "from_name": self.display_name})
+                send_encrypted_tcp(peer_ip, CALL_SIGNAL_PORT, {
+                    "type": "INVITE", "from_name": self.display_name,
+                    "call_salt": base64.b64encode(call_salt).decode("ascii"),
+                }, base64.b64decode(pubkey_b64))
             except OSError:
                 with self._lock:
                     if self.peer_ip == peer_ip:
@@ -698,10 +781,17 @@ class CallManager:
             if self.state != "ringing":
                 return
             peer_id, peer_ip, peer_name = self.peer_id, self.peer_ip, self.peer_name
+        pubkey_b64 = self.store.get_peer_pubkey(peer_id)
+        if not pubkey_b64:
+            with self._lock:
+                self._reset_to_idle()
+            self.on_event({"event": "call_failed", "peer_name": peer_name})
+            return
 
         def send_accept():
             try:
-                send_json_tcp(peer_ip, CALL_SIGNAL_PORT, {"type": "ACCEPT", "from_id": DEVICE_ID})
+                send_encrypted_tcp(peer_ip, CALL_SIGNAL_PORT, {"type": "ACCEPT"},
+                                    base64.b64decode(pubkey_b64))
             except OSError:
                 with self._lock:
                     if self.peer_ip == peer_ip:
@@ -725,10 +815,14 @@ class CallManager:
             peer_id, peer_ip, peer_name, direction = self.peer_id, self.peer_ip, self.peer_name, self._direction
             self._log_call(peer_id, peer_name, direction, "rejected")
             self._reset_to_idle()
+        pubkey_b64 = self.store.get_peer_pubkey(peer_id)
 
         def send_reject():
+            if not pubkey_b64:
+                return
             try:
-                send_json_tcp(peer_ip, CALL_SIGNAL_PORT, {"type": "REJECT", "from_id": DEVICE_ID})
+                send_encrypted_tcp(peer_ip, CALL_SIGNAL_PORT, {"type": "REJECT"},
+                                    base64.b64decode(pubkey_b64))
             except OSError:
                 pass
 
@@ -746,26 +840,43 @@ class CallManager:
         self._stop_audio()
 
         if should_notify:
+            pubkey_b64 = self.store.get_peer_pubkey(peer_id)
+
             def send_hangup():
+                if not pubkey_b64:
+                    return
                 try:
-                    send_json_tcp(peer_ip, CALL_SIGNAL_PORT, {"type": "HANGUP", "from_id": DEVICE_ID})
+                    send_encrypted_tcp(peer_ip, CALL_SIGNAL_PORT, {"type": "HANGUP"},
+                                        base64.b64decode(pubkey_b64))
                 except OSError:
                     pass
 
             threading.Thread(target=send_hangup, daemon=True).start()
 
     # -- audio streaming ------------------------------------------------
+    # Each call gets its own symmetric key (derived from the pair's shared
+    # secret plus a random per-call salt exchanged in INVITE), so keys
+    # aren't reused across calls even though the underlying identity keys
+    # are static. Frames use random nonces since UDP can reorder/drop
+    # packets, so a counter can't be safely relied on for uniqueness here.
 
     def _start_audio(self):
+        pubkey_b64 = self.store.get_peer_pubkey(self.peer_id)
+        if not pubkey_b64 or not self._call_salt:
+            return
+        peer_pubkey = base64.b64decode(pubkey_b64)
+        self._call_key = IDENTITY.shared_key_with(peer_pubkey, context=b"lancom-call:" + self._call_salt)
+
         self.audio = make_audio_io()
         self.audio.start_playback()
 
         self._audio_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         def on_frame(data):
-            if self._audio_send_sock and self.peer_ip:
+            if self._audio_send_sock and self.peer_ip and self._call_key:
                 try:
-                    self._audio_send_sock.sendto(data, (self.peer_ip, AUDIO_PORT))
+                    encrypted = crypto_util.encrypt(self._call_key, data)
+                    self._audio_send_sock.sendto(encrypted, (self.peer_ip, AUDIO_PORT))
                 except OSError:
                     pass
 
@@ -787,8 +898,12 @@ class CallManager:
                 continue
             except OSError:
                 break
-            if self.audio and addr[0] == self.peer_ip:
-                self.audio.write_playback(data)
+            if self.audio and self._call_key and addr[0] == self.peer_ip:
+                try:
+                    decrypted = crypto_util.decrypt(self._call_key, data)
+                except Exception:
+                    continue
+                self.audio.write_playback(decrypted)
         sock.close()
 
     def _stop_audio(self):
@@ -807,10 +922,13 @@ class CallManager:
 # ---------------------------------------------------------------------------
 
 class FileTransferManager:
-    """Sends/receives arbitrary files over a dedicated TCP port. A small
-    JSON header (length-prefixed, like signaling) announces the filename
-    and size, followed by the raw file bytes streamed directly - no
-    base64/JSON overhead for the payload itself, so large files are fine."""
+    """Sends/receives arbitrary files over a dedicated TCP port. An
+    encrypted+authenticated JSON header announces the filename, size, and a
+    random per-transfer salt; the file body is streamed as fixed-size
+    chunks, each independently encrypted (ChaCha20-Poly1305) with a key
+    derived from that salt and a counter nonce - safe because the salt (and
+    therefore the key) is fresh every transfer, so a restarting counter
+    never repeats under the same key."""
 
     def __init__(self, display_name, store, files_dir, on_event):
         self.display_name = display_name
@@ -857,33 +975,52 @@ class FileTransferManager:
     def _handle_incoming(self, conn, addr):
         with conn:
             try:
-                header = recv_json_tcp(conn)
+                header = recv_encrypted_tcp(conn, self.store.get_peer_pubkey)
             except OSError:
                 return
             if not header or header.get("type") != "FILE_META":
                 return
+            peer_id = header["_sender_id"]
+            peer_name = header.get("from_name", "Unknown")
             filename = os.path.basename(header.get("filename") or "file")
             size = int(header.get("size") or 0)
-            peer_id = header.get("from_id", "unknown")
-            peer_name = header.get("from_name", "Unknown")
+
+            pubkey_b64 = self.store.get_peer_pubkey(peer_id)
+            try:
+                transfer_salt = base64.b64decode(header.get("salt", ""))
+            except Exception:
+                transfer_salt = b""
+            if not pubkey_b64 or not transfer_salt:
+                return
+            file_key = IDENTITY.shared_key_with(base64.b64decode(pubkey_b64),
+                                                 context=b"lancom-file:" + transfer_salt)
 
             os.makedirs(self.files_dir, exist_ok=True)
             dest_path = self._unique_path(filename)
 
             received = 0
+            chunk_index = 0
             status = "failed"
             try:
                 conn.settimeout(30.0)
                 with open(dest_path, "wb") as f:
                     while received < size:
-                        chunk = conn.recv(min(FILE_CHUNK, size - received))
-                        if not chunk:
+                        plain_len = min(FILE_CHUNK, size - received)
+                        blob = recv_exact(conn, plain_len + FILE_TAG_LEN)
+                        if blob is None:
                             break
-                        f.write(chunk)
-                        received += len(chunk)
+                        nonce = chunk_index.to_bytes(12, "big")
+                        plaintext = crypto_util.decrypt_with_nonce(file_key, nonce, blob)
+                        f.write(plaintext)
+                        received += len(plaintext)
+                        chunk_index += 1
                 if received == size:
                     status = "completed"
             except OSError:
+                status = "failed"
+            except Exception:
+                # tampered/undecryptable chunk - abort, don't keep a
+                # partially-decrypted file that silently looks complete
                 status = "failed"
 
             self.store.add_file_record(peer_id, peer_name, "in", filename, size, dest_path, status)
@@ -893,30 +1030,46 @@ class FileTransferManager:
     def send_file(self, peer_id, peer_name, peer_ip, file_path):
         """Blocking - call from a background thread."""
         filename = os.path.basename(file_path)
+        pubkey_b64 = self.store.get_peer_pubkey(peer_id)
         try:
             size = os.path.getsize(file_path)
         except OSError:
-            self.store.add_file_record(peer_id, peer_name, "out", filename, 0, file_path, "failed")
+            size = 0
+        if not pubkey_b64 or not size:
+            self.store.add_file_record(peer_id, peer_name, "out", filename, size, file_path, "failed")
             self.on_event({"event": "file_send_failed", "peer_id": peer_id, "peer_name": peer_name,
-                            "filename": filename, "size": 0, "status": "failed"})
+                            "filename": filename, "size": size, "status": "failed"})
             return
 
-        header = {"type": "FILE_META", "filename": filename, "size": size,
-                  "from_id": DEVICE_ID, "from_name": self.display_name}
+        peer_pubkey = base64.b64decode(pubkey_b64)
+        transfer_salt = os.urandom(16)
+        file_key = IDENTITY.shared_key_with(peer_pubkey, context=b"lancom-file:" + transfer_salt)
+        header_key = IDENTITY.shared_key_with(peer_pubkey)
+        header_blob = crypto_util.encrypt(header_key, json.dumps({
+            "type": "FILE_META", "filename": filename, "size": size,
+            "from_name": self.display_name,
+            "salt": base64.b64encode(transfer_salt).decode("ascii"),
+        }).encode("utf-8"))
+
         status = "failed"
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(10.0)
                 sock.connect((peer_ip, FILE_PORT))
-                data = json.dumps(header).encode("utf-8")
-                sock.sendall(struct.pack("!I", len(data)) + data)
+                sock.sendall(IDENTITY.peer_id.encode("ascii"))
+                sock.sendall(struct.pack("!I", len(header_blob)) + header_blob)
+
                 sock.settimeout(30.0)
+                chunk_index = 0
                 with open(file_path, "rb") as f:
                     while True:
                         chunk = f.read(FILE_CHUNK)
                         if not chunk:
                             break
-                        sock.sendall(chunk)
+                        nonce = chunk_index.to_bytes(12, "big")
+                        encrypted = crypto_util.encrypt_with_nonce(file_key, nonce, chunk)
+                        sock.sendall(encrypted)
+                        chunk_index += 1
             status = "completed"
         except OSError:
             status = "failed"
@@ -1099,12 +1252,17 @@ ScreenManager:
                     text_size: self.size
                     valign: "bottom"
                 Label:
-                    text: root.peer_status
+                    text: "\U0001F512 " + root.peer_status
                     font_size: dp(11)
                     color: (0.36, 0.82, 0.55, 1) if root.peer_online else (0.46, 0.46, 0.52, 1)
                     halign: "left"
                     text_size: self.size
                     valign: "top"
+            GhostButton:
+                text: "ID"
+                size_hint_x: None
+                width: dp(40)
+                on_release: root.show_fingerprint()
             LuxButton:
                 text: "Call"
                 size_hint_x: None
@@ -1382,6 +1540,26 @@ class ChatScreen(Screen):
             return
         App.get_running_app().start_call(self.peer["id"], self.peer["ip"], self.peer["name"])
 
+    def show_fingerprint(self):
+        app = App.get_running_app()
+        peer_pubkey_b64 = self.peer.get("pubkey")
+        their_fp = (crypto_util.fingerprint(base64.b64decode(peer_pubkey_b64))
+                    if peer_pubkey_b64 else "unavailable")
+        my_fp = crypto_util.fingerprint(app.identity.public_bytes)
+        content = Label(
+            text=(f"All messages, calls, and files with {self.peer_name}\n"
+                  f"are end-to-end encrypted.\n\n"
+                  f"To confirm you're really talking to {self.peer_name}\n"
+                  f"and not an impostor on the network, read these\n"
+                  f"codes aloud to each other and check they match:\n\n"
+                  f"Your code:\n{my_fp}\n\n"
+                  f"{self.peer_name}'s code:\n{their_fp}"),
+            halign="center",
+        )
+        content.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        Popup(title="Verify identity", content=content,
+              size_hint=(0.9, 0.6)).open()
+
     def on_send(self, text):
         text = text.strip()
         if not text:
@@ -1532,12 +1710,17 @@ class LancomApp(App):
     display_name = StringProperty("")
 
     def build(self):
+        global IDENTITY
         self.discovery = None
         self.message_server = None
         self.call_manager = None
         self.file_manager = None
         self.profile_store = JsonStore(self.user_data_dir + "/lancom.json")
-        self.store = Store(os.path.join(self.user_data_dir, "lancom.db"))
+
+        IDENTITY = crypto_util.Identity.load_or_create(
+            os.path.join(self.user_data_dir, "identity.key"))
+        self.identity = IDENTITY
+        self.store = Store(os.path.join(self.user_data_dir, "lancom.db"), IDENTITY.storage_key())
 
         return Builder.load_string(KV)
 

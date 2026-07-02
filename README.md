@@ -38,6 +38,44 @@ connection (after a small JSON header announcing the filename/size) rather
 than wrapping the payload in base64/JSON, so it isn't limited to small
 files the way the messaging/signaling protocol is.
 
+## Security
+
+Every device generates a persistent X25519 identity keypair on first
+launch (`crypto_util.Identity`, stored in the app's private storage). A
+device's id is `SHA-256(public_key)[:16]` — self-certifying, so nothing on
+the LAN can claim to be a contact it doesn't hold the private key for.
+
+- **Messaging, call signaling, and file transfer are all
+  authenticated-encrypted** (ChaCha20-Poly1305), never plaintext. The
+  symmetric key for a given pair of devices is derived via X25519 ECDH
+  between their identity keys. There's no plaintext fallback: if we don't
+  have a peer's public key (i.e. we've never seen a discovery broadcast
+  from them), we simply can't talk to them.
+- **Call audio** gets its own key per call (derived from the pair's shared
+  secret plus a random salt exchanged during signaling), so audio keys
+  aren't reused across calls.
+- **Local storage**: message text and filenames are encrypted at rest
+  (key derived from the device's own identity key, domain-separated from
+  the transport key, never transmitted) — protects the SQLite file if
+  pulled off the device.
+- **Manual verification**: tap "ID" in a chat to see a short fingerprint
+  for both devices (like a Signal/SSH safety number) - read them aloud to
+  confirm you're really talking to who you think, the same way TOFU
+  ("trust on first use") systems recommend.
+
+**What this does *not* give you**: the shared key per pair is static (same
+key every time, derived from long-term identity keys), not renegotiated
+per session — deliberately: a simple, correct scheme beats a home-grown
+ratcheting/forward-secrecy protocol implemented under time pressure. This
+means compromise of either device's long-term private key can
+retroactively decrypt captured traffic between that pair. It does stop
+passive eavesdropping and active tampering/spoofing by any other device on
+the LAN, and messages/calls/files can't be intercepted or forged by a
+third device even with router/ARP-level access to the network.
+
+This is new and only unit/integration-tested locally (two real separate
+processes on loopback, not two phones) — see "Known limitations".
+
 ## Building the APK
 
 ### GitHub Actions (recommended)
@@ -110,6 +148,11 @@ The APK lands in `bin/`.
    from `WifiManager`, used first when available, since this app must work
    even on WiFi networks with no internet gateway where OS route
    resolution can be unreliable.
+9. Added `cryptography` to `buildozer.spec` requirements for the
+   encryption layer (see "Security" above) - it has an actively-maintained
+   python-for-android recipe, but this is the project's first dependency
+   with native/Rust build steps, so it's the first thing to check if a
+   build fails after this point.
 
 ## Known limitations / open work
 
@@ -143,19 +186,32 @@ The APK lands in `bin/`.
   plain filesystem path on some Android versions/OEMs - `open(path, "rb")`
   would fail on that. Needs a real-device test alongside audio; if file
   sending fails immediately, this is the first thing to check.
-- No encryption on any protocol - discovery, messaging, calls, and file
-  transfer are all plaintext, appropriate for a trusted home LAN and
-  nothing more sensitive than that.
+- **Encryption is new and unverified on real devices.** It's covered by
+  integration tests (two real OS processes talking over loopback,
+  simulating two phones) that confirm messages/files decrypt correctly,
+  raw DB bytes aren't plaintext, and tampered/wrong-key ciphertext is
+  rejected - but it hasn't run between two actual Android phones yet. If
+  messaging/calls/files stop working after updating, this is the first
+  thing to suspect (e.g. a peer's stored public key not being found).
+- Peer discovery (the UDP broadcast HELLO) is authenticated (the id must
+  match the claimed public key) but not encrypted - your display name and
+  the fact that you're running LANCOM are visible to anyone on the LAN.
+  Nothing else is.
+- No forward secrecy (see "Security" above) - a deliberate simplicity
+  trade-off, not an oversight.
+- Discovery, messaging, and call signaling have no rate limiting - a
+  malicious device on the LAN could still flood a phone with connection
+  attempts (denial of service), even though it can't forge or read
+  content anymore.
 - There is no iOS build. Kivy apps *can* target iOS via the separate
   `kivy-ios` toolchain, but that requires Xcode on a real Mac and, to
-  install on an actual iPhone, code-signing with an Apple ID (free personal
-  signing needs a Mac + USB cable; wider distribution needs a paid Apple
-  Developer account) - none of which is available from this build
-  environment. GitHub Actions does offer `macos-latest` runners with Xcode
-  pre-installed, so a CI job that runs `kivy-ios` to confirm the source at
-  least *builds* for iOS is realistic as a follow-up; turning that into
-  something installable on your phone still requires your own Apple ID and
-  Mac (or Xcode Cloud) for signing.
+  install on an actual iPhone/iPad, code-signing with an Apple ID (free
+  personal signing needs a Mac + USB cable; wider distribution needs a
+  paid Apple Developer account). Separately, very old iOS versions (e.g.
+  iOS 12, released 2018) may not be a supported deployment target for
+  current Xcode/kivy-ios at all, independent of the signing question -
+  this needs checking before investing time in a build aimed at old
+  hardware.
 
 ## Testing on a device
 

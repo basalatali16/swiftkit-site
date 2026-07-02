@@ -2,6 +2,7 @@
 # buildozer.spec controls what actually gets bundled into the APK).
 kivy==2.3.1
 plyer
+cryptography
 
 # Optional: enables mic/speaker testing on desktop. Has no python-for-android
 # recipe, so it is intentionally left out of buildozer.spec's requirements -
