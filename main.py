@@ -39,11 +39,40 @@ PEER_TIMEOUT = 7.0
 DEVICE_ID = uuid.uuid4().hex[:12]
 
 
+def _get_local_ip_via_wifi_manager():
+    """Ask Android's WifiManager for the WiFi interface's IP directly.
+    Avoids relying on the OS routing table, which can pick the wrong
+    interface (or fail outright) on a WiFi network with no internet
+    gateway - exactly the case this app is built for."""
+    from jnius import autoclass
+    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+    Context = autoclass("android.content.Context")
+    activity = PythonActivity.mActivity
+    wifi_manager = activity.getSystemService(Context.WIFI_SERVICE)
+    ip_int = wifi_manager.getConnectionInfo().getIpAddress()
+    if not ip_int:
+        return None
+    return socket.inet_ntoa(struct.pack("<I", ip_int))
+
+
 def get_local_ip():
     """Best-effort LAN IP without needing internet access."""
+    if platform == "android":
+        try:
+            ip = _get_local_ip_via_wifi_manager()
+            if ip and ip != "0.0.0.0":
+                return ip
+        except Exception:
+            pass
+
+    # Connecting a UDP socket doesn't send any packets - it just asks the
+    # kernel to resolve a route, which is enough to read back the local
+    # interface IP via getsockname(). Must be a plain unicast address:
+    # connecting to a broadcast address requires SO_BROADCAST first and
+    # raises PermissionError otherwise.
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("255.255.255.255", 1))
+        s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
     except OSError:
         return "127.0.0.1"
