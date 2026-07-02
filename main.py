@@ -23,7 +23,7 @@ from kivy.clock import Clock
 from kivy.lang import Builder
 from kivy.properties import StringProperty, BooleanProperty
 from kivy.storage.jsonstore import JsonStore
-from kivy.uix.screenmanager import Screen, ScreenManager, SlideTransition
+from kivy.uix.screenmanager import Screen, SlideTransition
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.utils import platform, escape_markup
@@ -1055,9 +1055,7 @@ class LancomApp(App):
         self.call_manager = None
         self.store = JsonStore(self.user_data_dir + "/lancom.json")
 
-        Builder.load_string(KV)
-        sm = ScreenManager()
-        return sm
+        return Builder.load_string(KV)
 
     def on_start(self):
         if platform == "android":
