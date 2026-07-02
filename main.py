@@ -2,16 +2,21 @@
 LANCOM - LAN-only voice calling and text messaging over WiFi.
 
 No internet, no server. Devices discover each other via UDP broadcast and
-talk directly, peer-to-peer, over the local WiFi network.
+talk directly, peer-to-peer, over the local WiFi network. All contacts,
+messages, call history, and file-transfer records persist locally on the
+device (SQLite) so history survives app restarts and is available even for
+peers that are currently offline.
 
 Ports:
   55555/UDP - peer discovery (broadcast)
   55556/TCP - text messaging
   55557/TCP - call signaling (invite/accept/reject/hangup)
   55558/UDP - call audio (raw PCM16 frames, best-effort)
+  55559/TCP - file transfer
 """
 
 import json
+import os
 import socket
 import struct
 import threading
@@ -20,23 +25,75 @@ import uuid
 
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.graphics import Color, RoundedRectangle
 from kivy.lang import Builder
+from kivy.metrics import dp
 from kivy.properties import StringProperty, BooleanProperty
 from kivy.storage.jsonstore import JsonStore
-from kivy.uix.screenmanager import Screen, SlideTransition
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
 from kivy.uix.label import Label
+from kivy.uix.screenmanager import Screen, SlideTransition
 from kivy.utils import platform, escape_markup
+
+from store import Store
 
 BROADCAST_PORT = 55555
 MESSAGE_PORT = 55556
 CALL_SIGNAL_PORT = 55557
 AUDIO_PORT = 55558
+FILE_PORT = 55559
 
 BROADCAST_INTERVAL = 2.0
 PEER_TIMEOUT = 7.0
+FILE_CHUNK = 65536
 
 DEVICE_ID = uuid.uuid4().hex[:12]
+
+# "Luxury" palette - deep navy background, warm gold accent.
+COLOR_BG = (0.035, 0.043, 0.078, 1)
+COLOR_CARD = (0.075, 0.086, 0.13, 1)
+COLOR_GOLD = (0.83, 0.69, 0.42, 1)
+COLOR_GOLD_DIM = (0.6, 0.5, 0.32, 1)
+COLOR_TEXT = (0.94, 0.93, 0.90, 1)
+COLOR_TEXT_DIM = (0.58, 0.58, 0.64, 1)
+COLOR_ONLINE = (0.36, 0.82, 0.55, 1)
+COLOR_OFFLINE = (0.46, 0.46, 0.52, 1)
+COLOR_DANGER = (0.80, 0.28, 0.28, 1)
+
+AVATAR_COLORS = [
+    (0.72, 0.45, 0.20), (0.30, 0.48, 0.75), (0.52, 0.36, 0.75),
+    (0.75, 0.32, 0.48), (0.30, 0.62, 0.48), (0.83, 0.69, 0.42),
+]
+
+
+def _color_for_name(name):
+    h = sum(ord(c) for c in name) if name else 0
+    return AVATAR_COLORS[h % len(AVATAR_COLORS)]
+
+
+def format_last_seen(ts):
+    if not ts:
+        return "never seen"
+    delta = time.time() - ts
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
+def format_size(n):
+    if not n:
+        return "0 B"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
 
 
 def _get_local_ip_via_wifi_manager():
@@ -192,7 +249,10 @@ if platform == "android":
                 chunk = 1024
                 buf = bytearray(chunk)
                 while self._capturing:
-                    n = self._record.read(buf, 0, chunk)
+                    try:
+                        n = self._record.read(buf, 0, chunk)
+                    except Exception:
+                        break
                     if n and n > 0:
                         callback(bytes(buf[:n]))
 
@@ -313,11 +373,12 @@ else:
 # ---------------------------------------------------------------------------
 
 class PeerDiscovery:
-    def __init__(self, display_name):
+    def __init__(self, display_name, store):
         self.display_name = display_name
+        self.store = store
         self.local_ip = get_local_ip()
         self.broadcast_ip = get_broadcast_ip(self.local_ip)
-        self.peers = {}  # device_id -> {"name", "ip", "last_seen"}
+        self.peers = {}  # device_id -> {"name", "ip", "last_seen"} (currently live only)
         self._lock = threading.Lock()
         self._running = False
 
@@ -339,9 +400,9 @@ class PeerDiscovery:
             "id": DEVICE_ID,
             "name": self.display_name,
         }
+        data = json.dumps(payload).encode("utf-8")
         while self._running:
             try:
-                data = json.dumps(payload).encode("utf-8")
                 sock.sendto(data, (self.broadcast_ip, BROADCAST_PORT))
             except OSError:
                 pass
@@ -372,13 +433,16 @@ class PeerDiscovery:
                 continue
             if msg.get("id") == DEVICE_ID:
                 continue
+            peer_id = msg["id"]
+            name = msg.get("name", "Unknown")
             with self._lock:
-                self.peers[msg["id"]] = {
-                    "id": msg["id"],
-                    "name": msg.get("name", "Unknown"),
+                self.peers[peer_id] = {
+                    "id": peer_id,
+                    "name": name,
                     "ip": addr[0],
                     "last_seen": time.time(),
                 }
+            self.store.upsert_peer(peer_id, name, addr[0])
         sock.close()
 
     def _reap_loop(self):
@@ -391,9 +455,27 @@ class PeerDiscovery:
                     del self.peers[pid]
             time.sleep(1.0)
 
-    def get_peers(self):
+    def get_known_peers(self):
+        """All contacts ever seen, online ones first, each flagged online/offline."""
         with self._lock:
-            return sorted(self.peers.values(), key=lambda p: p["name"].lower())
+            live = dict(self.peers)
+        result = []
+        seen_ids = set()
+        for p in self.store.get_known_peers():
+            seen_ids.add(p["id"])
+            live_info = live.get(p["id"])
+            if live_info:
+                result.append({"id": p["id"], "name": live_info["name"], "ip": live_info["ip"],
+                                "online": True, "last_seen": live_info["last_seen"]})
+            else:
+                result.append({"id": p["id"], "name": p["name"], "ip": p["ip"],
+                                "online": False, "last_seen": p["last_seen"]})
+        for pid, info in live.items():
+            if pid not in seen_ids:
+                result.append({"id": pid, "name": info["name"], "ip": info["ip"],
+                                "online": True, "last_seen": info["last_seen"]})
+        result.sort(key=lambda p: (not p["online"], p["name"].lower()))
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +483,9 @@ class PeerDiscovery:
 # ---------------------------------------------------------------------------
 
 class MessageServer:
-    def __init__(self, display_name, on_message):
+    def __init__(self, display_name, store, on_message):
         self.display_name = display_name
+        self.store = store
         self.on_message = on_message
         self._running = False
 
@@ -438,9 +521,13 @@ class MessageServer:
             if not msg:
                 return
             msg["ip"] = addr[0]
+            self.store.add_message(msg.get("from_id", "unknown"),
+                                    msg.get("from_name", "Unknown"),
+                                    "in", msg.get("text", ""))
             self.on_message(msg)
 
-    def send_message(self, peer_ip, text):
+    def send_message(self, peer_id, peer_name, peer_ip, text):
+        self.store.add_message(peer_id, peer_name, "out", text)
         payload = {
             "type": "MSG",
             "from_id": DEVICE_ID,
@@ -449,7 +536,6 @@ class MessageServer:
             "timestamp": time.time(),
         }
         send_json_tcp(peer_ip, MESSAGE_PORT, payload)
-        return payload
 
 
 # ---------------------------------------------------------------------------
@@ -459,14 +545,18 @@ class MessageServer:
 class CallManager:
     """Handles call signaling (TCP) and audio streaming (UDP)."""
 
-    def __init__(self, display_name, on_event):
+    def __init__(self, display_name, store, on_event):
         self.display_name = display_name
+        self.store = store
         self.on_event = on_event  # callback(event_dict) - marshalled to main thread by caller
         self._running = False
         self._lock = threading.Lock()
+        self.peer_id = None
         self.peer_ip = None
         self.peer_name = None
         self.state = "idle"  # idle | calling | ringing | active
+        self._direction = None  # "in" | "out"
+        self._call_start = None
         self.audio = None
         self._audio_send_sock = None
         self._audio_recv_thread = None
@@ -500,8 +590,16 @@ class CallManager:
 
     def _reset_to_idle(self):
         self.state = "idle"
+        self.peer_id = None
         self.peer_ip = None
         self.peer_name = None
+        self._direction = None
+        self._call_start = None
+
+    def _log_call(self, peer_id, peer_name, direction, outcome):
+        duration = (time.time() - self._call_start) if self._call_start else 0.0
+        self.store.add_call_log(peer_id or "unknown", peer_name or "Unknown",
+                                 direction or "out", outcome, duration)
 
     def _handle_signal(self, conn, addr):
         with conn:
@@ -517,9 +615,12 @@ class CallManager:
                 with self._lock:
                     busy = self.state != "idle"
                     if not busy:
+                        self.peer_id = msg.get("from_id")
                         self.peer_ip = addr[0]
                         self.peer_name = msg.get("from_name", "Unknown")
                         self.state = "ringing"
+                        self._direction = "in"
+                        self._call_start = None
                 if busy:
                     try:
                         send_json_tcp(addr[0], CALL_SIGNAL_PORT,
@@ -535,14 +636,19 @@ class CallManager:
             # could hijack or end a call in progress.
             with self._lock:
                 from_current_peer = self.peer_ip is not None and addr[0] == self.peer_ip
-                peer_name = self.peer_name
+                peer_id, peer_name, direction = self.peer_id, self.peer_name, self._direction
                 if msg_type == "ACCEPT" and from_current_peer and self.state == "calling":
                     self.state = "active"
+                    self._call_start = time.time()
                     action = "activate"
                 elif msg_type == "REJECT" and from_current_peer and self.state == "calling":
+                    self._log_call(peer_id, peer_name, direction, "rejected")
                     self._reset_to_idle()
                     action = "rejected"
                 elif msg_type == "HANGUP" and from_current_peer and self.state in ("active", "ringing", "calling"):
+                    outcome = "completed" if self._call_start else (
+                        "missed" if direction == "in" else "cancelled")
+                    self._log_call(peer_id, peer_name, direction, outcome)
                     self._reset_to_idle()
                     action = "ended"
                 else:
@@ -562,13 +668,16 @@ class CallManager:
     # block the Kivy UI thread on a slow/dead peer (send_json_tcp has up to
     # a 4s connect timeout).
 
-    def call(self, peer_ip, peer_name):
+    def call(self, peer_id, peer_ip, peer_name):
         with self._lock:
             if self.state != "idle":
                 return False
+            self.peer_id = peer_id
             self.peer_ip = peer_ip
             self.peer_name = peer_name
             self.state = "calling"
+            self._direction = "out"
+            self._call_start = None
 
         def send_invite():
             try:
@@ -577,6 +686,7 @@ class CallManager:
             except OSError:
                 with self._lock:
                     if self.peer_ip == peer_ip:
+                        self._log_call(peer_id, peer_name, "out", "failed")
                         self._reset_to_idle()
                 self.on_event({"event": "call_failed", "peer_name": peer_name})
 
@@ -587,8 +697,7 @@ class CallManager:
         with self._lock:
             if self.state != "ringing":
                 return
-            peer_ip = self.peer_ip
-            peer_name = self.peer_name
+            peer_id, peer_ip, peer_name = self.peer_id, self.peer_ip, self.peer_name
 
         def send_accept():
             try:
@@ -596,12 +705,14 @@ class CallManager:
             except OSError:
                 with self._lock:
                     if self.peer_ip == peer_ip:
+                        self._log_call(peer_id, peer_name, "in", "failed")
                         self._reset_to_idle()
                 self.on_event({"event": "call_failed", "peer_name": peer_name})
                 return
             with self._lock:
                 if self.peer_ip == peer_ip:
                     self.state = "active"
+                    self._call_start = time.time()
             self._start_audio()
             self.on_event({"event": "call_active", "peer_name": peer_name})
 
@@ -611,7 +722,8 @@ class CallManager:
         with self._lock:
             if self.state != "ringing":
                 return
-            peer_ip = self.peer_ip
+            peer_id, peer_ip, peer_name, direction = self.peer_id, self.peer_ip, self.peer_name, self._direction
+            self._log_call(peer_id, peer_name, direction, "rejected")
             self._reset_to_idle()
 
         def send_reject():
@@ -625,7 +737,11 @@ class CallManager:
     def hang_up(self):
         with self._lock:
             should_notify = self.state in ("active", "calling", "ringing") and self.peer_ip
-            peer_ip = self.peer_ip
+            peer_id, peer_ip, peer_name, direction = self.peer_id, self.peer_ip, self.peer_name, self._direction
+            if should_notify:
+                outcome = "completed" if self._call_start else (
+                    "missed" if direction == "in" else "cancelled")
+                self._log_call(peer_id, peer_name, direction, outcome)
             self._reset_to_idle()
         self._stop_audio()
 
@@ -687,6 +803,131 @@ class CallManager:
 
 
 # ---------------------------------------------------------------------------
+# File transfer
+# ---------------------------------------------------------------------------
+
+class FileTransferManager:
+    """Sends/receives arbitrary files over a dedicated TCP port. A small
+    JSON header (length-prefixed, like signaling) announces the filename
+    and size, followed by the raw file bytes streamed directly - no
+    base64/JSON overhead for the payload itself, so large files are fine."""
+
+    def __init__(self, display_name, store, files_dir, on_event):
+        self.display_name = display_name
+        self.store = store
+        self.files_dir = files_dir
+        self.on_event = on_event  # callback(event_dict) - caller marshals to main thread
+        self._running = False
+
+    def start(self):
+        self._running = True
+        threading.Thread(target=self._listen_loop, daemon=True).start()
+
+    def stop(self):
+        self._running = False
+
+    def _listen_loop(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", FILE_PORT))
+        sock.listen(5)
+        sock.settimeout(1.0)
+        while self._running:
+            try:
+                conn, addr = sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle_incoming, args=(conn, addr), daemon=True).start()
+        sock.close()
+
+    def _unique_path(self, filename):
+        path = os.path.join(self.files_dir, filename)
+        if not os.path.exists(path):
+            return path
+        base, ext = os.path.splitext(filename)
+        n = 1
+        while True:
+            candidate = os.path.join(self.files_dir, f"{base} ({n}){ext}")
+            if not os.path.exists(candidate):
+                return candidate
+            n += 1
+
+    def _handle_incoming(self, conn, addr):
+        with conn:
+            try:
+                header = recv_json_tcp(conn)
+            except OSError:
+                return
+            if not header or header.get("type") != "FILE_META":
+                return
+            filename = os.path.basename(header.get("filename") or "file")
+            size = int(header.get("size") or 0)
+            peer_id = header.get("from_id", "unknown")
+            peer_name = header.get("from_name", "Unknown")
+
+            os.makedirs(self.files_dir, exist_ok=True)
+            dest_path = self._unique_path(filename)
+
+            received = 0
+            status = "failed"
+            try:
+                conn.settimeout(30.0)
+                with open(dest_path, "wb") as f:
+                    while received < size:
+                        chunk = conn.recv(min(FILE_CHUNK, size - received))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        received += len(chunk)
+                if received == size:
+                    status = "completed"
+            except OSError:
+                status = "failed"
+
+            self.store.add_file_record(peer_id, peer_name, "in", filename, size, dest_path, status)
+            self.on_event({"event": "file_received", "peer_id": peer_id, "peer_name": peer_name,
+                            "filename": filename, "size": size, "status": status})
+
+    def send_file(self, peer_id, peer_name, peer_ip, file_path):
+        """Blocking - call from a background thread."""
+        filename = os.path.basename(file_path)
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            self.store.add_file_record(peer_id, peer_name, "out", filename, 0, file_path, "failed")
+            self.on_event({"event": "file_send_failed", "peer_id": peer_id, "peer_name": peer_name,
+                            "filename": filename, "size": 0, "status": "failed"})
+            return
+
+        header = {"type": "FILE_META", "filename": filename, "size": size,
+                  "from_id": DEVICE_ID, "from_name": self.display_name}
+        status = "failed"
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(10.0)
+                sock.connect((peer_ip, FILE_PORT))
+                data = json.dumps(header).encode("utf-8")
+                sock.sendall(struct.pack("!I", len(data)) + data)
+                sock.settimeout(30.0)
+                with open(file_path, "rb") as f:
+                    while True:
+                        chunk = f.read(FILE_CHUNK)
+                        if not chunk:
+                            break
+                        sock.sendall(chunk)
+            status = "completed"
+        except OSError:
+            status = "failed"
+
+        self.store.add_file_record(peer_id, peer_name, "out", filename, size, file_path, status)
+        self.on_event({"event": "file_sent" if status == "completed" else "file_send_failed",
+                        "peer_id": peer_id, "peer_name": peer_name,
+                        "filename": filename, "size": size, "status": status})
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
@@ -699,6 +940,27 @@ ScreenManager:
     ChatScreen:
     CallScreen:
 
+<LuxButton@Button>:
+    background_normal: ""
+    background_down: ""
+    background_color: 0.83, 0.69, 0.42, 1
+    color: 0.05, 0.06, 0.1, 1
+    bold: True
+
+<GhostButton@Button>:
+    background_normal: ""
+    background_down: ""
+    background_color: 0.12, 0.14, 0.21, 1
+    color: 0.83, 0.69, 0.42, 1
+    bold: True
+
+<DangerButton@Button>:
+    background_normal: ""
+    background_down: ""
+    background_color: 0.80, 0.28, 0.28, 1
+    color: 1, 1, 1, 1
+    bold: True
+
 <SetupScreen>:
     name: "setup"
     BoxLayout:
@@ -707,7 +969,7 @@ ScreenManager:
         spacing: dp(16)
         canvas.before:
             Color:
-                rgba: 0.043, 0.059, 0.102, 1
+                rgba: 0.035, 0.043, 0.078, 1
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -717,14 +979,15 @@ ScreenManager:
 
         Label:
             text: "LANCOM"
-            font_size: dp(36)
+            font_size: dp(40)
             bold: True
+            color: 0.83, 0.69, 0.42, 1
             size_hint_y: None
-            height: dp(48)
+            height: dp(52)
 
         Label:
             text: "LAN voice + messaging, no internet needed"
-            color: 0.6, 0.6, 0.65, 1
+            color: 0.58, 0.58, 0.64, 1
             size_hint_y: None
             height: dp(24)
 
@@ -738,15 +1001,19 @@ ScreenManager:
             size_hint_y: None
             height: dp(48)
             padding: dp(12), dp(12)
+            background_color: 0.075, 0.086, 0.13, 1
+            foreground_color: 0.94, 0.93, 0.90, 1
+            hint_text_color: 0.5, 0.5, 0.55, 1
+            cursor_color: 0.83, 0.69, 0.42, 1
 
         Label:
             id: setup_error
             text: ""
-            color: 0.9, 0.3, 0.3, 1
+            color: 0.80, 0.28, 0.28, 1
             size_hint_y: None
             height: dp(20)
 
-        Button:
+        LuxButton:
             text: "Continue"
             size_hint_y: None
             height: dp(48)
@@ -760,7 +1027,7 @@ ScreenManager:
         orientation: "vertical"
         canvas.before:
             Color:
-                rgba: 0.043, 0.059, 0.102, 1
+                rgba: 0.035, 0.043, 0.078, 1
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -768,21 +1035,22 @@ ScreenManager:
         BoxLayout:
             size_hint_y: None
             height: dp(56)
-            padding: dp(12), dp(8)
+            padding: dp(16), dp(8)
             Label:
-                text: "Nearby devices"
+                text: "LANCOM"
                 bold: True
-                font_size: dp(18)
+                font_size: dp(20)
+                color: 0.83, 0.69, 0.42, 1
                 halign: "left"
                 text_size: self.size
 
         Label:
             id: debug_info
             text: ""
-            font_size: dp(11)
-            color: 0.45, 0.45, 0.5, 1
+            font_size: dp(10)
+            color: 0.4, 0.4, 0.46, 1
             size_hint_y: None
-            height: dp(18)
+            height: dp(16)
 
         ScrollView:
             BoxLayout:
@@ -790,8 +1058,8 @@ ScreenManager:
                 orientation: "vertical"
                 size_hint_y: None
                 height: self.minimum_height
-                padding: dp(8)
-                spacing: dp(8)
+                padding: dp(10)
+                spacing: dp(6)
 
 <ChatScreen>:
     name: "chat"
@@ -799,7 +1067,7 @@ ScreenManager:
         orientation: "vertical"
         canvas.before:
             Color:
-                rgba: 0.043, 0.059, 0.102, 1
+                rgba: 0.035, 0.043, 0.078, 1
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -809,19 +1077,40 @@ ScreenManager:
             height: dp(56)
             padding: dp(8)
             spacing: dp(8)
-            Button:
+            canvas.before:
+                Color:
+                    rgba: 0.075, 0.086, 0.13, 1
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+            GhostButton:
                 text: "< Back"
                 size_hint_x: None
                 width: dp(80)
                 on_release: root.on_back()
-            Label:
-                text: root.peer_name
-                bold: True
-                font_size: dp(18)
-            Button:
+            BoxLayout:
+                orientation: "vertical"
+                Label:
+                    text: root.peer_name
+                    bold: True
+                    font_size: dp(17)
+                    color: 0.94, 0.93, 0.90, 1
+                    halign: "left"
+                    text_size: self.size
+                    valign: "bottom"
+                Label:
+                    text: root.peer_status
+                    font_size: dp(11)
+                    color: (0.36, 0.82, 0.55, 1) if root.peer_online else (0.46, 0.46, 0.52, 1)
+                    halign: "left"
+                    text_size: self.size
+                    valign: "top"
+            LuxButton:
                 text: "Call"
                 size_hint_x: None
-                width: dp(70)
+                width: dp(64)
+                disabled: not root.peer_online
+                opacity: 1 if root.peer_online else 0.4
                 on_release: root.on_call()
 
         ScrollView:
@@ -831,20 +1120,29 @@ ScreenManager:
                 orientation: "vertical"
                 size_hint_y: None
                 height: self.minimum_height
-                padding: dp(8)
-                spacing: dp(6)
+                padding: dp(10)
+                spacing: dp(8)
 
         BoxLayout:
             size_hint_y: None
             height: dp(56)
             padding: dp(8)
             spacing: dp(8)
+            GhostButton:
+                text: "File"
+                size_hint_x: None
+                width: dp(56)
+                on_release: root.on_send_file()
             TextInput:
                 id: chat_input
                 multiline: False
                 hint_text: "Message"
+                background_color: 0.075, 0.086, 0.13, 1
+                foreground_color: 0.94, 0.93, 0.90, 1
+                hint_text_color: 0.5, 0.5, 0.55, 1
+                cursor_color: 0.83, 0.69, 0.42, 1
                 on_text_validate: root.on_send(chat_input.text)
-            Button:
+            LuxButton:
                 text: "Send"
                 size_hint_x: None
                 width: dp(70)
@@ -858,7 +1156,7 @@ ScreenManager:
         spacing: dp(16)
         canvas.before:
             Color:
-                rgba: 0.043, 0.059, 0.102, 1
+                rgba: 0.035, 0.043, 0.078, 1
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -870,12 +1168,13 @@ ScreenManager:
             text: root.peer_name
             font_size: dp(28)
             bold: True
+            color: 0.94, 0.93, 0.90, 1
             size_hint_y: None
             height: dp(40)
 
         Label:
             text: root.status_text
-            color: 0.6, 0.6, 0.65, 1
+            color: 0.83, 0.69, 0.42, 1
             size_hint_y: None
             height: dp(28)
 
@@ -885,14 +1184,13 @@ ScreenManager:
             size_hint_y: None
             height: dp(64)
             spacing: dp(16)
-            Button:
+            LuxButton:
                 text: "Accept"
                 opacity: 1 if root.show_accept else 0
                 disabled: not root.show_accept
                 on_release: root.on_accept()
-            Button:
+            DangerButton:
                 text: "Reject" if root.show_accept else "Hang Up"
-                background_color: 0.8, 0.2, 0.2, 1
                 on_release: root.on_reject_or_hangup()
 
         Widget:
@@ -911,25 +1209,65 @@ class SetupScreen(Screen):
         self.manager.current = "users"
 
 
-class PeerRow(BoxLayout):
+class Avatar(Label):
+    def __init__(self, name, **kwargs):
+        color = _color_for_name(name or "?")
+        super().__init__(text=(name[:1] or "?").upper(), bold=True, color=(1, 1, 1, 1),
+                          size_hint=(None, None), size=(dp(44), dp(44)), **kwargs)
+        with self.canvas.before:
+            Color(*color)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(10)])
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_args):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+
+
+class ContactRow(BoxLayout):
     def __init__(self, peer, on_open_chat, on_call, **kwargs):
-        super().__init__(orientation="horizontal", size_hint_y=None, height=56,
-                          spacing=8, **kwargs)
+        super().__init__(orientation="horizontal", size_hint_y=None, height=dp(68),
+                          spacing=dp(12), padding=(dp(6), dp(4)), **kwargs)
         self.peer = peer
-        info = BoxLayout(orientation="vertical")
-        info.add_widget(Label(text=peer["name"], bold=True, halign="left",
-                               text_size=(None, None)))
-        info.add_widget(Label(text=peer["ip"], color=(0.55, 0.55, 0.6, 1), font_size=12))
+        online = peer.get("online", False)
+
+        with self.canvas.before:
+            Color(0.075, 0.086, 0.13, 1)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])
+        self.bind(pos=self._sync, size=self._sync)
+
+        self.add_widget(Avatar(peer["name"]))
+
+        info = BoxLayout(orientation="vertical", spacing=dp(2))
+        name_label = Label(text=escape_markup(peer["name"]), bold=True, font_size=dp(15),
+                            color=(0.94, 0.93, 0.90, 1), halign="left", valign="bottom",
+                            size_hint_y=0.55)
+        name_label.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        status_text = "● Online" if online else f"○ Last seen {format_last_seen(peer.get('last_seen'))}"
+        status_color = (0.36, 0.82, 0.55, 1) if online else (0.46, 0.46, 0.52, 1)
+        status_label = Label(text=status_text, font_size=dp(12), color=status_color,
+                              halign="left", valign="top", size_hint_y=0.45)
+        status_label.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        info.add_widget(name_label)
+        info.add_widget(status_label)
         self.add_widget(info)
 
-        from kivy.uix.button import Button
-        chat_btn = Button(text="Chat", size_hint_x=None, width=70)
+        chat_btn = Button(text="Chat", size_hint_x=None, width=dp(64),
+                           background_normal="", background_color=(0.12, 0.14, 0.21, 1),
+                           color=(0.83, 0.69, 0.42, 1), bold=True)
         chat_btn.bind(on_release=lambda *_: on_open_chat(peer))
         self.add_widget(chat_btn)
 
-        call_btn = Button(text="Call", size_hint_x=None, width=70)
+        call_btn = Button(text="Call", size_hint_x=None, width=dp(64), disabled=not online,
+                           opacity=1 if online else 0.35,
+                           background_normal="", background_color=(0.83, 0.69, 0.42, 1),
+                           color=(0.05, 0.06, 0.1, 1), bold=True)
         call_btn.bind(on_release=lambda *_: on_call(peer))
         self.add_widget(call_btn)
+
+    def _sync(self, *_args):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
 
 
 class UsersScreen(Screen):
@@ -948,7 +1286,7 @@ class UsersScreen(Screen):
             f"This device: {app.discovery.local_ip}  "
             f"|  broadcasting to: {app.discovery.broadcast_ip}"
         )
-        peers = app.discovery.get_peers()
+        peers = app.discovery.get_known_peers()
         container = self.ids.peer_list
         container.clear_widgets()
         if not peers:
@@ -956,17 +1294,18 @@ class UsersScreen(Screen):
                                         size_hint_y=None, height=40,
                                         color=(0.5, 0.5, 0.55, 1)))
         for peer in peers:
-            container.add_widget(PeerRow(peer, self.open_chat, self.call_peer))
+            container.add_widget(ContactRow(peer, self.open_chat, self.call_peer))
 
     def open_chat(self, peer):
-        app = App.get_running_app()
         chat = self.manager.get_screen("chat")
         chat.set_peer(peer)
         self.manager.transition = SlideTransition(direction="left")
         self.manager.current = "chat"
 
     def call_peer(self, peer):
-        App.get_running_app().start_call(peer["ip"], peer["name"])
+        if not peer.get("online"):
+            return
+        App.get_running_app().start_call(peer["id"], peer["ip"], peer["name"])
 
 
 class ChatBubble(BoxLayout):
@@ -975,9 +1314,24 @@ class ChatBubble(BoxLayout):
         safe_sender = escape_markup(sender)
         safe_text = escape_markup(text)
         label = Label(text=f"[b]{safe_sender}[/b]\n{safe_text}", markup=True,
-                       halign="left" if not mine else "right",
-                       size_hint_y=None)
+                      color=(0.94, 0.93, 0.90, 1),
+                      halign="left" if not mine else "right",
+                      size_hint_y=None)
         label.bind(texture_size=lambda inst, val: setattr(label, "height", val[1] + 10))
+        label.bind(width=lambda inst, val: setattr(label, "text_size", (val, None)))
+        self.add_widget(label)
+        self.bind(minimum_height=self.setter("height"))
+
+
+class ChatEvent(BoxLayout):
+    """A muted, centered line for call/file history entries interleaved
+    with messages - e.g. 'Missed call', 'Sent report.pdf (2.4 MB)'."""
+
+    def __init__(self, text, **kwargs):
+        super().__init__(orientation="vertical", size_hint_y=None, **kwargs)
+        label = Label(text=escape_markup(text), font_size=dp(12),
+                      color=(0.55, 0.55, 0.6, 1), size_hint_y=None, halign="center")
+        label.bind(texture_size=lambda inst, val: setattr(label, "height", val[1] + 6))
         label.bind(width=lambda inst, val: setattr(label, "text_size", (val, None)))
         self.add_widget(label)
         self.bind(minimum_height=self.setter("height"))
@@ -985,37 +1339,90 @@ class ChatBubble(BoxLayout):
 
 class ChatScreen(Screen):
     peer_name = StringProperty("")
+    peer_status = StringProperty("")
+    peer_online = BooleanProperty(False)
     peer = None
 
     def set_peer(self, peer):
         self.peer = peer
         self.peer_name = peer["name"]
+        self.peer_online = bool(peer.get("online"))
+        self.peer_status = "Online" if self.peer_online else f"Last seen {format_last_seen(peer.get('last_seen'))}"
         self.ids.message_list.clear_widgets()
+        self.load_history()
+
+    def load_history(self):
+        app = App.get_running_app()
+        peer_id = self.peer["id"]
+        items = []
+        for m in app.store.get_messages(peer_id):
+            items.append((m["timestamp"], "message", m))
+        for c in app.store.get_call_log(peer_id):
+            items.append((c["timestamp"], "call", c))
+        for f in app.store.get_files(peer_id):
+            items.append((f["timestamp"], "file", f))
+        items.sort(key=lambda x: x[0])
+        for _ts, kind, item in items:
+            if kind == "message":
+                mine = item["direction"] == "out"
+                sender = app.display_name if mine else self.peer_name
+                self.append_message(sender, item["text"], mine=mine)
+            elif kind == "call":
+                self.append_event(self._call_log_text(item))
+            elif kind == "file":
+                self.append_event(self._file_log_text(item))
 
     def on_back(self):
         self.manager.transition = SlideTransition(direction="right")
         self.manager.current = "users"
 
     def on_call(self):
-        App.get_running_app().start_call(self.peer["ip"], self.peer["name"])
+        if not self.peer_online:
+            self.append_event("Can't call - this device is offline")
+            return
+        App.get_running_app().start_call(self.peer["id"], self.peer["ip"], self.peer["name"])
 
     def on_send(self, text):
         text = text.strip()
         if not text:
             return
         app = App.get_running_app()
+        peer_id = self.peer["id"]
         peer_ip = self.peer["ip"]
         peer_name = self.peer_name
 
         def do_send():
             try:
-                app.message_server.send_message(peer_ip, text)
+                app.message_server.send_message(peer_id, peer_name, peer_ip, text)
             except OSError:
                 Clock.schedule_once(lambda dt: self._on_send_failed(peer_name), 0)
 
         threading.Thread(target=do_send, daemon=True).start()
         self.append_message(app.display_name, text, mine=True)
         self.ids.chat_input.text = ""
+
+    def on_send_file(self):
+        try:
+            from plyer import filechooser
+        except Exception:
+            self.append_event("File picker unavailable on this device")
+            return
+        filechooser.open_file(on_selection=self._on_file_chosen)
+
+    def _on_file_chosen(self, selection):
+        if not selection:
+            return
+        Clock.schedule_once(lambda dt: self._start_file_send(selection[0]), 0)
+
+    def _start_file_send(self, path):
+        app = App.get_running_app()
+        peer = self.peer
+        self.append_event(f"Sending {os.path.basename(path)}…")
+
+        def do_send():
+            app.file_manager.send_file(peer["id"], peer["name"], peer["ip"], path)
+
+        threading.Thread(target=do_send, daemon=True).start()
 
     def _on_send_failed(self, peer_name):
         if self.peer_name == peer_name:
@@ -1026,9 +1433,43 @@ class ChatScreen(Screen):
         self.ids.message_list.add_widget(bubble)
         Clock.schedule_once(lambda dt: setattr(self.ids.chat_scroll, "scroll_y", 0), 0.05)
 
+    def append_event(self, text):
+        self.ids.message_list.add_widget(ChatEvent(text))
+        Clock.schedule_once(lambda dt: setattr(self.ids.chat_scroll, "scroll_y", 0), 0.05)
+
     def receive_message(self, msg):
-        if self.peer and msg.get("ip") == self.peer.get("ip"):
+        if self.peer and msg.get("from_id") == self.peer.get("id"):
             self.append_message(msg.get("from_name", "Unknown"), msg.get("text", ""), mine=False)
+
+    def receive_file_event(self, event):
+        if not self.peer or self.peer.get("id") != event.get("peer_id"):
+            return
+        direction = "in" if event["event"] == "file_received" else "out"
+        row = {"direction": direction, "filename": event["filename"],
+               "size": event.get("size", 0), "status": event.get("status", "failed")}
+        self.append_event(self._file_log_text(row))
+
+    @staticmethod
+    def _call_log_text(c):
+        icon = "\U0001F4DE"
+        if c["outcome"] == "missed":
+            return f"{icon} Missed call"
+        if c["outcome"] == "rejected":
+            return f"{icon} Call declined"
+        if c["outcome"] in ("failed", "cancelled"):
+            return f"{icon} Call not connected"
+        mins, secs = divmod(int(c["duration"] or 0), 60)
+        which = "Outgoing" if c["direction"] == "out" else "Incoming"
+        return f"{icon} {which} call – {mins:02d}:{secs:02d}"
+
+    @staticmethod
+    def _file_log_text(f):
+        icon = "\U0001F4CE"
+        which = "Sent" if f["direction"] == "out" else "Received"
+        size_str = format_size(f["size"])
+        if f["status"] != "completed":
+            return f"{icon} {which} {f['filename']} ({size_str}) – failed"
+        return f"{icon} {which} {f['filename']} ({size_str})"
 
 
 class CallScreen(Screen):
@@ -1094,7 +1535,9 @@ class LancomApp(App):
         self.discovery = None
         self.message_server = None
         self.call_manager = None
-        self.store = JsonStore(self.user_data_dir + "/lancom.json")
+        self.file_manager = None
+        self.profile_store = JsonStore(self.user_data_dir + "/lancom.json")
+        self.store = Store(os.path.join(self.user_data_dir, "lancom.db"))
 
         return Builder.load_string(KV)
 
@@ -1107,12 +1550,14 @@ class LancomApp(App):
                     Permission.ACCESS_WIFI_STATE,
                     Permission.ACCESS_NETWORK_STATE,
                     Permission.INTERNET,
+                    Permission.READ_EXTERNAL_STORAGE,
+                    Permission.WRITE_EXTERNAL_STORAGE,
                 ])
             except Exception:
                 pass
 
-        if self.store.exists("profile"):
-            name = self.store.get("profile").get("name", "")
+        if self.profile_store.exists("profile"):
+            name = self.profile_store.get("profile").get("name", "")
             if name:
                 self.set_display_name(name)
                 self.root.current = "users"
@@ -1121,16 +1566,20 @@ class LancomApp(App):
 
     def set_display_name(self, name):
         self.display_name = name
-        self.store.put("profile", name=name)
+        self.profile_store.put("profile", name=name)
 
-        self.discovery = PeerDiscovery(name)
+        self.discovery = PeerDiscovery(name, self.store)
         self.discovery.start()
 
-        self.message_server = MessageServer(name, self._on_message_received)
+        self.message_server = MessageServer(name, self.store, self._on_message_received)
         self.message_server.start()
 
-        self.call_manager = CallManager(name, self._on_call_event)
+        self.call_manager = CallManager(name, self.store, self._on_call_event)
         self.call_manager.start()
+
+        files_dir = os.path.join(self.user_data_dir, "received_files")
+        self.file_manager = FileTransferManager(name, self.store, files_dir, self._on_file_event)
+        self.file_manager.start()
 
     def _on_message_received(self, msg):
         Clock.schedule_once(lambda dt: self._dispatch_message(msg), 0)
@@ -1158,8 +1607,15 @@ class LancomApp(App):
         elif kind == "call_ended":
             call_screen.on_ended("Call ended")
 
-    def start_call(self, ip, name):
-        if self.call_manager.call(ip, name):
+    def _on_file_event(self, event):
+        Clock.schedule_once(lambda dt: self._dispatch_file_event(event), 0)
+
+    def _dispatch_file_event(self, event):
+        chat = self.root.get_screen("chat")
+        chat.receive_file_event(event)
+
+    def start_call(self, peer_id, ip, name):
+        if self.call_manager.call(peer_id, ip, name):
             call_screen = self.root.get_screen("call")
             call_screen.on_calling(name)
             self.root.transition = SlideTransition(direction="up")
@@ -1172,6 +1628,8 @@ class LancomApp(App):
             self.message_server.stop()
         if self.call_manager:
             self.call_manager.stop()
+        if self.file_manager:
+            self.file_manager.stop()
 
 
 if __name__ == "__main__":
