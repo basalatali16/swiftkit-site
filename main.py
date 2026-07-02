@@ -21,12 +21,12 @@ import uuid
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.lang import Builder
-from kivy.properties import ListProperty, StringProperty, BooleanProperty
+from kivy.properties import StringProperty, BooleanProperty
 from kivy.storage.jsonstore import JsonStore
 from kivy.uix.screenmanager import Screen, ScreenManager, SlideTransition
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
-from kivy.utils import platform
+from kivy.utils import platform, escape_markup
 
 BROADCAST_PORT = 55555
 MESSAGE_PORT = 55556
@@ -77,11 +77,16 @@ def recv_exact(sock, n):
     return bytes(buf)
 
 
+MAX_MESSAGE_BYTES = 64 * 1024
+
+
 def recv_json_tcp(conn):
     header = recv_exact(conn, 4)
     if header is None:
         return None
     (length,) = struct.unpack("!I", header)
+    if length > MAX_MESSAGE_BYTES:
+        return None
     payload = recv_exact(conn, length)
     if payload is None:
         return None
@@ -406,7 +411,7 @@ class MessageServer:
             msg["ip"] = addr[0]
             self.on_message(msg)
 
-    def send_message(self, peer_ip, peer_id, text):
+    def send_message(self, peer_ip, text):
         payload = {
             "type": "MSG",
             "from_id": DEVICE_ID,
@@ -429,6 +434,7 @@ class CallManager:
         self.display_name = display_name
         self.on_event = on_event  # callback(event_dict) - marshalled to main thread by caller
         self._running = False
+        self._lock = threading.Lock()
         self.peer_ip = None
         self.peer_name = None
         self.state = "idle"  # idle | calling | ringing | active
@@ -463,6 +469,11 @@ class CallManager:
             threading.Thread(target=self._handle_signal, args=(conn, addr), daemon=True).start()
         sock.close()
 
+    def _reset_to_idle(self):
+        self.state = "idle"
+        self.peer_ip = None
+        self.peer_name = None
+
     def _handle_signal(self, conn, addr):
         with conn:
             try:
@@ -474,89 +485,129 @@ class CallManager:
             msg_type = msg.get("type")
 
             if msg_type == "INVITE":
-                if self.state != "idle":
-                    # busy - reject immediately
+                with self._lock:
+                    busy = self.state != "idle"
+                    if not busy:
+                        self.peer_ip = addr[0]
+                        self.peer_name = msg.get("from_name", "Unknown")
+                        self.state = "ringing"
+                if busy:
                     try:
                         send_json_tcp(addr[0], CALL_SIGNAL_PORT,
                                       {"type": "REJECT", "from_id": DEVICE_ID, "reason": "busy"})
                     except OSError:
                         pass
                     return
-                self.peer_ip = addr[0]
-                self.peer_name = msg.get("from_name", "Unknown")
-                self.state = "ringing"
                 self.on_event({"event": "incoming_call", "peer_name": self.peer_name, "peer_ip": self.peer_ip})
+                return
 
-            elif msg_type == "ACCEPT":
-                if self.state == "calling":
+            # ACCEPT/REJECT/HANGUP only apply to messages from the peer we're
+            # actually talking to - otherwise any other device on the LAN
+            # could hijack or end a call in progress.
+            with self._lock:
+                from_current_peer = self.peer_ip is not None and addr[0] == self.peer_ip
+                peer_name = self.peer_name
+                if msg_type == "ACCEPT" and from_current_peer and self.state == "calling":
                     self.state = "active"
-                    self._start_audio()
-                    self.on_event({"event": "call_active", "peer_name": self.peer_name})
+                    action = "activate"
+                elif msg_type == "REJECT" and from_current_peer and self.state == "calling":
+                    self._reset_to_idle()
+                    action = "rejected"
+                elif msg_type == "HANGUP" and from_current_peer and self.state in ("active", "ringing", "calling"):
+                    self._reset_to_idle()
+                    action = "ended"
+                else:
+                    action = None
 
-            elif msg_type == "REJECT":
-                if self.state == "calling":
-                    self.state = "idle"
-                    self.on_event({"event": "call_rejected", "peer_name": self.peer_name})
-                    self.peer_ip = None
-                    self.peer_name = None
-
-            elif msg_type == "HANGUP":
-                if self.state in ("active", "ringing", "calling"):
-                    self._stop_audio()
-                    self.state = "idle"
-                    self.on_event({"event": "call_ended", "peer_name": self.peer_name})
-                    self.peer_ip = None
-                    self.peer_name = None
+            if action == "activate":
+                self._start_audio()
+                self.on_event({"event": "call_active", "peer_name": peer_name})
+            elif action == "rejected":
+                self.on_event({"event": "call_rejected", "peer_name": peer_name})
+            elif action == "ended":
+                self._stop_audio()
+                self.on_event({"event": "call_ended", "peer_name": peer_name})
 
     # -- outgoing actions ---------------------------------------------------
+    # Signaling sends run on a background thread so button presses never
+    # block the Kivy UI thread on a slow/dead peer (send_json_tcp has up to
+    # a 4s connect timeout).
 
     def call(self, peer_ip, peer_name):
-        if self.state != "idle":
-            return
-        self.peer_ip = peer_ip
-        self.peer_name = peer_name
-        self.state = "calling"
-        try:
-            send_json_tcp(peer_ip, CALL_SIGNAL_PORT,
-                          {"type": "INVITE", "from_id": DEVICE_ID, "from_name": self.display_name})
-        except OSError:
-            self.state = "idle"
-            self.on_event({"event": "call_failed", "peer_name": peer_name})
-            self.peer_ip = None
-            self.peer_name = None
+        with self._lock:
+            if self.state != "idle":
+                return False
+            self.peer_ip = peer_ip
+            self.peer_name = peer_name
+            self.state = "calling"
+
+        def send_invite():
+            try:
+                send_json_tcp(peer_ip, CALL_SIGNAL_PORT,
+                              {"type": "INVITE", "from_id": DEVICE_ID, "from_name": self.display_name})
+            except OSError:
+                with self._lock:
+                    if self.peer_ip == peer_ip:
+                        self._reset_to_idle()
+                self.on_event({"event": "call_failed", "peer_name": peer_name})
+
+        threading.Thread(target=send_invite, daemon=True).start()
+        return True
 
     def accept(self):
-        if self.state != "ringing":
-            return
-        try:
-            send_json_tcp(self.peer_ip, CALL_SIGNAL_PORT, {"type": "ACCEPT", "from_id": DEVICE_ID})
-        except OSError:
-            self.state = "idle"
-            return
-        self.state = "active"
-        self._start_audio()
+        with self._lock:
+            if self.state != "ringing":
+                return
+            peer_ip = self.peer_ip
+            peer_name = self.peer_name
+
+        def send_accept():
+            try:
+                send_json_tcp(peer_ip, CALL_SIGNAL_PORT, {"type": "ACCEPT", "from_id": DEVICE_ID})
+            except OSError:
+                with self._lock:
+                    if self.peer_ip == peer_ip:
+                        self._reset_to_idle()
+                self.on_event({"event": "call_failed", "peer_name": peer_name})
+                return
+            with self._lock:
+                if self.peer_ip == peer_ip:
+                    self.state = "active"
+            self._start_audio()
+            self.on_event({"event": "call_active", "peer_name": peer_name})
+
+        threading.Thread(target=send_accept, daemon=True).start()
 
     def reject(self):
-        if self.state != "ringing":
-            return
-        try:
-            send_json_tcp(self.peer_ip, CALL_SIGNAL_PORT, {"type": "REJECT", "from_id": DEVICE_ID})
-        except OSError:
-            pass
-        self.state = "idle"
-        self.peer_ip = None
-        self.peer_name = None
+        with self._lock:
+            if self.state != "ringing":
+                return
+            peer_ip = self.peer_ip
+            self._reset_to_idle()
 
-    def hang_up(self):
-        if self.state in ("active", "calling", "ringing") and self.peer_ip:
+        def send_reject():
             try:
-                send_json_tcp(self.peer_ip, CALL_SIGNAL_PORT, {"type": "HANGUP", "from_id": DEVICE_ID})
+                send_json_tcp(peer_ip, CALL_SIGNAL_PORT, {"type": "REJECT", "from_id": DEVICE_ID})
             except OSError:
                 pass
+
+        threading.Thread(target=send_reject, daemon=True).start()
+
+    def hang_up(self):
+        with self._lock:
+            should_notify = self.state in ("active", "calling", "ringing") and self.peer_ip
+            peer_ip = self.peer_ip
+            self._reset_to_idle()
         self._stop_audio()
-        self.state = "idle"
-        self.peer_ip = None
-        self.peer_name = None
+
+        if should_notify:
+            def send_hangup():
+                try:
+                    send_json_tcp(peer_ip, CALL_SIGNAL_PORT, {"type": "HANGUP", "from_id": DEVICE_ID})
+                except OSError:
+                    pass
+
+            threading.Thread(target=send_hangup, daemon=True).start()
 
     # -- audio streaming ------------------------------------------------
 
@@ -586,12 +637,12 @@ class CallManager:
         sock.settimeout(1.0)
         while self._audio_recv_running:
             try:
-                data, _addr = sock.recvfrom(4096)
+                data, addr = sock.recvfrom(4096)
             except socket.timeout:
                 continue
             except OSError:
                 break
-            if self.audio:
+            if self.audio and addr[0] == self.peer_ip:
                 self.audio.write_playback(data)
         sock.close()
 
@@ -874,16 +925,15 @@ class UsersScreen(Screen):
         self.manager.current = "chat"
 
     def call_peer(self, peer):
-        app = App.get_running_app()
-        app.start_call(peer["ip"], peer["name"])
-        self.manager.transition = SlideTransition(direction="up")
-        self.manager.current = "call"
+        App.get_running_app().start_call(peer["ip"], peer["name"])
 
 
 class ChatBubble(BoxLayout):
     def __init__(self, text, sender, mine, **kwargs):
         super().__init__(orientation="vertical", size_hint_y=None, **kwargs)
-        label = Label(text=f"[b]{sender}[/b]\n{text}", markup=True,
+        safe_sender = escape_markup(sender)
+        safe_text = escape_markup(text)
+        label = Label(text=f"[b]{safe_sender}[/b]\n{safe_text}", markup=True,
                        halign="left" if not mine else "right",
                        size_hint_y=None)
         label.bind(texture_size=lambda inst, val: setattr(label, "height", val[1] + 10))
@@ -894,6 +944,7 @@ class ChatBubble(BoxLayout):
 
 class ChatScreen(Screen):
     peer_name = StringProperty("")
+    peer = None
 
     def set_peer(self, peer):
         self.peer = peer
@@ -905,23 +956,29 @@ class ChatScreen(Screen):
         self.manager.current = "users"
 
     def on_call(self):
-        app = App.get_running_app()
-        app.start_call(self.peer["ip"], self.peer["name"])
-        self.manager.transition = SlideTransition(direction="up")
-        self.manager.current = "call"
+        App.get_running_app().start_call(self.peer["ip"], self.peer["name"])
 
     def on_send(self, text):
         text = text.strip()
         if not text:
             return
         app = App.get_running_app()
-        try:
-            app.message_server.send_message(self.peer["ip"], self.peer.get("id"), text)
-        except OSError:
-            self.append_message("System", f"Failed to send: peer unreachable", mine=False)
-            return
+        peer_ip = self.peer["ip"]
+        peer_name = self.peer_name
+
+        def do_send():
+            try:
+                app.message_server.send_message(peer_ip, text)
+            except OSError:
+                Clock.schedule_once(lambda dt: self._on_send_failed(peer_name), 0)
+
+        threading.Thread(target=do_send, daemon=True).start()
         self.append_message(app.display_name, text, mine=True)
         self.ids.chat_input.text = ""
+
+    def _on_send_failed(self, peer_name):
+        if self.peer_name == peer_name:
+            self.append_message("System", "Failed to send: peer unreachable", mine=False)
 
     def append_message(self, sender, text, mine):
         bubble = ChatBubble(text, sender, mine)
@@ -1063,9 +1120,11 @@ class LancomApp(App):
             call_screen.on_ended("Call ended")
 
     def start_call(self, ip, name):
-        call_screen = self.root.get_screen("call")
-        call_screen.on_calling(name)
-        self.call_manager.call(ip, name)
+        if self.call_manager.call(ip, name):
+            call_screen = self.root.get_screen("call")
+            call_screen.on_calling(name)
+            self.root.transition = SlideTransition(direction="up")
+            self.root.current = "call"
 
     def on_stop(self):
         if self.discovery:

@@ -89,6 +89,16 @@ The APK lands in `bin/`.
   routers block device-to-device traffic on the same WiFi (common on guest
   networks / some mesh systems). If discovery doesn't work, check the
   router's AP/client isolation setting first.
+- **Discovery assumes a /24 subnet** (`get_broadcast_ip` in `main.py` builds
+  the broadcast address as `x.y.z.255`). On networks with a different mask
+  (common on enterprise WiFi or some hotspot configs), the broadcast won't
+  reach every device and this looks identical to the AP-isolation failure
+  above.
+- **A peer's IP is cached for up to `PEER_TIMEOUT` (7s) after it disappears.**
+  If another device is assigned that IP by DHCP in that window, a call or
+  message aimed at the original peer's name can briefly reach the new
+  device instead. Low-probability on a typical home network, but worth
+  knowing before relying on this for anything sensitive.
 
 ## Testing on a device
 
