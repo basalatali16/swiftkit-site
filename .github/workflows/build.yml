@@ -21,24 +21,25 @@ jobs:
       - name: Cache buildozer global cache
         uses: actions/cache@v4
         with:
-          path: ~/.buildozer
+          path: ~/.buildozer-global-cache
           key: buildozer-global-${{ hashFiles('buildozer.spec') }}
 
-      - name: Cache buildozer app build
-        uses: actions/cache@v4
-        with:
-          path: .buildozer
-          key: buildozer-app-${{ hashFiles('buildozer.spec') }}
-
+      # Runs the official kivy/buildozer Docker image directly rather than
+      # going through a third-party wrapper action - a prior run showed
+      # ArtemSBulgakov/buildozer-action@v1 building its own Dockerfile on
+      # top of that image (to add a newer JDK via the openjdk-r PPA), and
+      # that PPA 404s against current ubuntu-latest runners. The kivy/buildozer
+      # image already ships a working JDK, so no extra layer is needed.
       - name: Build APK with buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
-        with:
-          command: buildozer android debug
-          buildozer_version: stable
+        run: |
+          mkdir -p ~/.buildozer-global-cache
+          docker run --rm \
+            --volume "${{ github.workspace }}":/home/user/hostcwd \
+            --volume "$HOME/.buildozer-global-cache":/home/user/.buildozer \
+            kivy/buildozer:latest android debug
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: lancom-debug-apk
-          path: ${{ steps.buildozer.outputs.filename }}
+          path: bin/*.apk
