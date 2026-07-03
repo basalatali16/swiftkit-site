@@ -7,7 +7,7 @@ package.domain = com.localnet
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 
-version = 0.2
+version = 0.2.1
 
 # Kivy 2.3.1 added support for newer CPython (3.13+), which matches the
 # Python version python-for-android currently bundles by default. Pinning
@@ -46,6 +46,18 @@ android.archs = arm64-v8a
 android.ndk = 28c
 
 android.accept_sdk_license = True
+
+# The APK from the release p4a crashed on device with
+#   ImportError: dlopen failed: cannot locate symbol "_Py_TrueStruct"
+#   referenced by .../cryptography/hazmat/bindings/_rust.abi3.so
+# Rust-built extensions weren't explicitly linked against libpython, and
+# Android's bionic linker (no lazy binding) refuses to resolve those
+# symbols at load time. Fixed in p4a develop by PR #3333 (2026-05-21,
+# adds -Clink-arg=-lpython3.x to RUSTFLAGS), which is NOT in any tagged
+# release yet (latest: v2026.05.09). Pinned to a develop commit that
+# contains the fix; drop these two lines once a release includes it.
+p4a.branch = develop
+p4a.commit = 10d4798ecfec22c0f6765638c4f81fd1811b351a
 
 [buildozer]
 log_level = 2

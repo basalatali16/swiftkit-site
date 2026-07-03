@@ -67,6 +67,14 @@ open).
   libcrypto/libssl present, cryptography 46.0.3 with arm64
   _rust.abi3.so, all modules in private.tar. So a missing/wrong-arch
   native lib is ruled out; awaiting the on-screen traceback.
+- ROOT CAUSE FOUND (owner sent the crash-screen traceback - the
+  reporter worked): `ImportError: dlopen failed: cannot locate symbol
+  "_Py_TrueStruct" referenced by ..._rust.abi3.so`. p4a's Rust build
+  didn't link extensions against libpython; bionic has no lazy binding.
+  Fixed upstream in p4a develop PR #3333 (2026-05-21), not in any
+  release (latest v2026.05.09). buildozer.spec now pins p4a.branch =
+  develop @ commit 10d4798 which contains the fix. Drop the pin when a
+  p4a release includes it.
 - LIKELY install-failure cause found: CI regenerated the debug keystore
   every run → different signature each build → Android refuses
   install-over-existing ("App not installed"). Fixed: stable PKCS12
