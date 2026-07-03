@@ -30,6 +30,7 @@ from kivy.metrics import dp
 from kivy.properties import StringProperty, BooleanProperty
 from kivy.resources import resource_find
 from kivy.storage.jsonstore import JsonStore
+from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.image import Image as KivyImage
@@ -906,8 +907,12 @@ class RoundButton(Button):
         self._color.rgba = self._bg_down if state == "down" else self._bg
 
 
+class TapBox(ButtonBehavior, BoxLayout):
+    """A BoxLayout that fires on_release - used for tappable row areas."""
+
+
 class ContactRow(BoxLayout):
-    def __init__(self, peer, on_open_chat, on_call, **kwargs):
+    def __init__(self, peer, on_open_chat, on_call, on_details=None, **kwargs):
         super().__init__(orientation="horizontal", size_hint_y=None, height=dp(68),
                           spacing=dp(12), padding=(dp(6), dp(4)), **kwargs)
         self.peer = peer
@@ -921,7 +926,10 @@ class ContactRow(BoxLayout):
         self.add_widget(Avatar(peer["name"], online=online,
                                 pos_hint={"center_y": 0.5}))
 
-        info = BoxLayout(orientation="vertical", spacing=dp(2))
+        # Tapping the name/status area opens the contact-details popup.
+        info = TapBox(orientation="vertical", spacing=dp(2))
+        if on_details:
+            info.bind(on_release=lambda *_: on_details(peer))
         # shorten=True keeps each line single-height with a trailing
         # ellipsis instead of letter-wrapping when a name outgrows the
         # space between the avatar and the buttons.
@@ -987,7 +995,52 @@ class UsersScreen(Screen):
                                         size_hint_y=None, height=40,
                                         color=(0.55, 0.52, 0.66, 1)))
         for peer in peers:
-            container.add_widget(ContactRow(peer, self.open_chat, self.call_peer))
+            container.add_widget(ContactRow(peer, self.open_chat, self.call_peer,
+                                             on_details=self.show_contact_details))
+
+    def show_contact_details(self, peer):
+        """Everything known about a contact: device model, IP, presence,
+        and the identity code used for encryption verification."""
+        fp = (crypto_util.fingerprint(base64.b64decode(peer["pubkey"]))
+              if peer.get("pubkey") else "unavailable")
+        status = ("Online now" if peer.get("online")
+                  else f"Last seen {format_last_seen(peer.get('last_seen'))}")
+
+        content = BoxLayout(orientation="vertical", spacing=dp(4),
+                             padding=(dp(10), dp(10)))
+
+        def row(caption, value, value_color=COLOR_TEXT):
+            box = BoxLayout(orientation="vertical", size_hint_y=None,
+                             height=dp(42), spacing=dp(1))
+            cap = Label(text=caption, font_size=dp(11),
+                         color=COLOR_TEXT_DIM, halign="left",
+                         size_hint_y=None, height=dp(16))
+            cap.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+            v = Label(text=escape_markup(str(value)), font_size=dp(14),
+                       color=value_color, halign="left", shorten=True,
+                       shorten_from="right", size_hint_y=None, height=dp(22))
+            v.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+            box.add_widget(cap)
+            box.add_widget(v)
+            content.add_widget(box)
+
+        content.add_widget(Widget(size_hint_y=None, height=dp(8)))
+        row("Name", peer.get("name", "Unknown"))
+        row("Device", peer.get("device") or "Unknown")
+        row("IP address", peer.get("ip") or "-")
+        row("Status", status,
+            COLOR_ONLINE if peer.get("online") else COLOR_TEXT_DIM)
+        row("Identity code (for verification)", fp)
+
+        close_btn = RoundButton(bg=COLOR_CARD, text="Close", bold=True,
+                                 color=COLOR_TEXT_DIM,
+                                 size_hint_y=None, height=dp(44))
+        content.add_widget(Widget(size_hint_y=None, height=dp(4)))
+        content.add_widget(close_btn)
+        popup = Popup(title="Contact details", content=content,
+                       size_hint=(0.92, None), height=dp(345))
+        close_btn.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
 
     def show_pin_popup(self):
         """Set, change, or remove the app PIN lock."""
@@ -1410,8 +1463,10 @@ class ChatScreen(Screen):
         their_fp = (crypto_util.fingerprint(base64.b64decode(peer_pubkey_b64))
                     if peer_pubkey_b64 else "unavailable")
         my_fp = crypto_util.fingerprint(app.identity.public_bytes)
+        device = self.peer.get("device") or "Unknown device"
         content = Label(
-            text=(f"All messages, calls, and files with {self.peer_name}\n"
+            text=(f"Device: {device}\n\n"
+                  f"All messages, calls, and files with {self.peer_name}\n"
                   f"are end-to-end encrypted.\n\n"
                   f"To confirm you're really talking to {self.peer_name}\n"
                   f"and not an impostor on the network, read these\n"

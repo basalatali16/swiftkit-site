@@ -68,6 +68,35 @@ def app_data_dir():
     return os.path.join(base, "lancom")
 
 
+_device_label = None
+
+
+def device_label():
+    """Human-readable name of THIS device (e.g. 'Samsung SM-A525F' or a
+    PC's computer name) - broadcast with discovery so contacts can see
+    what hardware they're talking to."""
+    global _device_label
+    if _device_label is not None:
+        return _device_label
+    label = ""
+    if IS_ANDROID:
+        try:
+            from jnius import autoclass
+            Build = autoclass("android.os.Build")
+            manu = (Build.MANUFACTURER or "").strip()
+            model = (Build.MODEL or "").strip()
+            label = f"{manu} {model}".strip() if model else manu
+            label = label[:1].upper() + label[1:] if label else ""
+        except Exception:
+            label = "Android device"
+    else:
+        import platform as _platform
+        label = os.environ.get("COMPUTERNAME") or _platform.node() or "PC"
+        label = f"{label} ({_platform.system()})"
+    _device_label = label[:48]
+    return _device_label
+
+
 def android_context():
     """Context for jnius calls that works in BOTH processes: the activity
     when running in the app, the service otherwise."""
@@ -494,6 +523,7 @@ class PeerDiscovery:
             "type": "LANCOM_HELLO",
             "id": IDENTITY.peer_id,
             "name": self.display_name,
+            "device": device_label(),
             "pubkey": base64.b64encode(IDENTITY.public_bytes).decode("ascii"),
         }
         if probe:
@@ -576,6 +606,7 @@ class PeerDiscovery:
                 continue
             peer_id = msg["id"]
             name = msg.get("name", "Unknown")
+            device = str(msg.get("device", ""))[:48]
             with self._lock:
                 came_online = peer_id not in self.peers
                 self.peers[peer_id] = {
@@ -583,9 +614,11 @@ class PeerDiscovery:
                     "name": name,
                     "ip": addr[0],
                     "pubkey": pubkey_b64,
+                    "device": device,
                     "last_seen": time.time(),
                 }
-            self.store.upsert_peer(peer_id, name, addr[0], pubkey_b64)
+            self.store.upsert_peer(peer_id, name, addr[0], pubkey_b64,
+                                   device=device)
             if msg.get("probe"):
                 # A directed probe means our broadcasts likely never reach
                 # this device - answer straight back to the packet's source
@@ -623,15 +656,18 @@ class PeerDiscovery:
             if live_info:
                 result.append({"id": p["id"], "name": live_info["name"], "ip": live_info["ip"],
                                 "pubkey": live_info["pubkey"],
+                                "device": live_info.get("device") or p.get("device") or "",
                                 "online": True, "last_seen": live_info["last_seen"]})
             else:
                 result.append({"id": p["id"], "name": p["name"], "ip": p["ip"],
                                 "pubkey": p["pubkey"],
+                                "device": p.get("device") or "",
                                 "online": False, "last_seen": p["last_seen"]})
         for pid, info in live.items():
             if pid not in seen_ids:
                 result.append({"id": pid, "name": info["name"], "ip": info["ip"],
                                 "pubkey": info["pubkey"],
+                                "device": info.get("device", ""),
                                 "online": True, "last_seen": info["last_seen"]})
         result.sort(key=lambda p: (not p["online"], p["name"].lower()))
         return result

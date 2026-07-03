@@ -93,6 +93,7 @@ class Store:
             # Upgrading older DBs that predate these columns.
             for ddl in (
                 "ALTER TABLE peers ADD COLUMN pubkey TEXT",
+                "ALTER TABLE peers ADD COLUMN device TEXT",
                 "ALTER TABLE messages ADD COLUMN msg_id TEXT",
                 # Outgoing: '' (pre-status rows) | pending | delivered | seen.
                 "ALTER TABLE messages ADD COLUMN status TEXT DEFAULT ''",
@@ -122,23 +123,30 @@ class Store:
 
     # -- peers / contacts -------------------------------------------------
 
-    def upsert_peer(self, peer_id, name, ip, pubkey_b64):
+    def upsert_peer(self, peer_id, name, ip, pubkey_b64, device=""):
         with self._lock:
             self._conn.execute(
-                "INSERT INTO peers (id, name, last_ip, pubkey, last_seen) VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO peers (id, name, last_ip, pubkey, last_seen, device) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET name=excluded.name, "
-                "last_ip=excluded.last_ip, pubkey=excluded.pubkey, last_seen=excluded.last_seen",
-                (peer_id, name, ip, pubkey_b64, time.time()),
+                "last_ip=excluded.last_ip, pubkey=excluded.pubkey, "
+                "last_seen=excluded.last_seen, "
+                # don't blank a known device model with an empty update
+                "device=CASE WHEN excluded.device != '' THEN excluded.device "
+                "ELSE peers.device END",
+                (peer_id, name, ip, pubkey_b64, time.time(), device or ""),
             )
             self._conn.commit()
 
     def get_known_peers(self):
         with self._lock:
             cur = self._conn.execute(
-                "SELECT id, name, last_ip, pubkey, last_seen FROM peers ORDER BY name COLLATE NOCASE"
+                "SELECT id, name, last_ip, pubkey, last_seen, device "
+                "FROM peers ORDER BY name COLLATE NOCASE"
             )
             return [
-                {"id": r[0], "name": r[1], "ip": r[2], "pubkey": r[3], "last_seen": r[4]}
+                {"id": r[0], "name": r[1], "ip": r[2], "pubkey": r[3],
+                 "last_seen": r[4], "device": r[5] or ""}
                 for r in cur.fetchall()
             ]
 
