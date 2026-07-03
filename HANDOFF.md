@@ -120,6 +120,27 @@ round implemented in v0.3 (build #16):
 - Owner's file-share crash screenshot never arrived (attach failed
   twice); SAF picker most likely fixes it, but confirm on device.
 
+## Feature round 3 (2026-07-03, v0.4 / build #17)
+
+Owner's build #16 device test: file transfer, ticks, UI all confirmed
+working on device. Two fixes shipped in v0.4:
+
+- Background notifications: Kivy's Clock is PAUSED while backgrounded;
+  notifications routed via Clock.schedule_once only fired on app
+  reopen (matches owner's exact symptom). Now fired directly from the
+  worker threads when not foregrounded (messages, incoming calls, and
+  now completed incoming files). KEY LESSON: never route
+  background-critical work through the Kivy Clock.
+- Received files: exported to public Downloads/LANCOM (MediaStore API
+  29+, direct write below), images keep a private copy and render as
+  inline ChatImageBubble previews; non-images are moved not copied.
+
+STILL OPEN: if the owner needs delivery after the app is SWIPED AWAY
+from recents (not just backgrounded), that requires a p4a foreground
+service running the networking stack in the service process (major
+refactor: UI<->service IPC, service-owned DB writes). Owner asked to
+test the backgrounded-vs-swiped distinction with build #17.
+
 ## Next steps
 
 1. A new CI build was pushed after these changes — check its result on
