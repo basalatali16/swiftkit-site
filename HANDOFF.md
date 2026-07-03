@@ -56,6 +56,36 @@ open).
   crash; screenshots reviewed.
 - NONE of this session's work is device-verified yet.
 
+## Crash investigation + signing (2026-07-03, later)
+
+- Owner reported the run #11 APK "installed but crashing on install".
+- main.py is now a thin crash-reporter entry point; the real app moved
+  to lancom_app.py. Any startup crash shows the full traceback on the
+  phone screen (screenshot = crash log) and appends to lancom_crash.log
+  in app storage.
+- Static APK inspection (run #13 artifact) showed packaging is CLEAN:
+  libcrypto/libssl present, cryptography 46.0.3 with arm64
+  _rust.abi3.so, all modules in private.tar. So a missing/wrong-arch
+  native lib is ruled out; awaiting the on-screen traceback.
+- LIKELY install-failure cause found: CI regenerated the debug keystore
+  every run → different signature each build → Android refuses
+  install-over-existing ("App not installed"). Fixed: stable PKCS12
+  debug keystore stored as repo secret LANCOM_KEYSTORE_B64, injected in
+  CI and mounted at /home/user/.android. Local backup (NOT in the repo -
+  repo is public):
+  `C:\Users\basal\Documents\CHROME EXTENTIONS\claude code\lancom-signing\debug.keystore`
+  (alias androiddebugkey, store/key password "android"). Owner should
+  back this file up; for a real release a proper private keystore is
+  still needed.
+- Workflow paths filter now triggers on any **.py (was main.py only -
+  would have silently skipped builds after the entry-point split).
+- New app icon (gold L monogram + green presence dot on navy) and
+  presplash shipped in v0.2.
+- Owner asked for "blockchain, not easy to crack": explained blockchain
+  adds nothing to a serverless LAN app; E2E crypto already covers
+  network security; proposed license-key activation as the real
+  anti-piracy feature (not built yet - awaiting owner decision).
+
 ## Next steps
 
 1. A new CI build was pushed after these changes — check its result on

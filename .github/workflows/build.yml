@@ -6,7 +6,10 @@ on:
       - main
       - "claude/**"
     paths:
-      - "main.py"
+      # "**.py" not just main.py: the app was split into main.py (crash-
+      # reporter entry) + lancom_app.py + modules - a fix in any of them
+      # must trigger a build.
+      - "**.py"
       - "buildozer.spec"
       - "assets/**"
       - ".github/workflows/build.yml"
@@ -75,12 +78,29 @@ jobs:
       # top of that image (to add a newer JDK via the openjdk-r PPA), and
       # that PPA 404s against current ubuntu-latest runners. The kivy/buildozer
       # image already ships a working JDK, so no extra layer is needed.
+      # Stable debug signing key (repo secret LANCOM_KEYSTORE_B64).
+      # Without it each CI run generates a fresh throwaway keystore, so
+      # Android refuses to install any new build over a previously
+      # installed one ("App not installed" - signature mismatch). One
+      # fixed key = updates install over each other like a real app.
+      # If the secret is absent the dir stays empty and buildozer falls
+      # back to generating a keystore (old behavior).
+      - name: Restore stable debug keystore
+        env:
+          LANCOM_KEYSTORE_B64: ${{ secrets.LANCOM_KEYSTORE_B64 }}
+        run: |
+          mkdir -p ~/.android-lancom
+          if [ -n "$LANCOM_KEYSTORE_B64" ]; then
+            echo "$LANCOM_KEYSTORE_B64" | base64 -d > ~/.android-lancom/debug.keystore
+          fi
+
       - name: Build APK with buildozer
         run: |
           mkdir -p ~/.buildozer-global-cache
           docker run --rm \
             --volume "${{ github.workspace }}":/home/user/hostcwd \
             --volume "$HOME/.buildozer-global-cache":/home/user/.buildozer \
+            --volume "$HOME/.android-lancom":/home/user/.android \
             --volume "$HOME/.rustup-cache":/home/user/.rustup \
             --volume "$HOME/.cargo-cache":/home/user/.cargo \
             --env PATH="/home/user/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
