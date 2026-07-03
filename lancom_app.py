@@ -17,6 +17,7 @@ cross-process read safe).
 """
 
 import base64
+import hashlib
 import os
 import threading
 import time
@@ -266,6 +267,15 @@ class DirectBackend:
     def probe_ip(self, ip):
         return self.core.probe_ip(ip)
 
+    def send_typing(self, peer_id, peer_ip, typing):
+        self.core.send_typing(peer_id, peer_ip, typing)
+
+    def delete_message(self, peer_id, row_id=None, msg_id=None):
+        self.core.delete_message(peer_id, row_id=row_id, msg_id=msg_id)
+
+    def clear_chat(self, peer_id):
+        self.core.clear_chat(peer_id)
+
     def call(self, peer_id, peer_ip, peer_name):
         return self.core.call(peer_id, peer_ip, peer_name)
 
@@ -357,6 +367,17 @@ class ServiceBackend:
         reply = self.client.request({"cmd": "probe_ip", "ip": ip})
         return bool(reply and reply.get("ok"))
 
+    def send_typing(self, peer_id, peer_ip, typing):
+        self.client.notify({"cmd": "typing", "peer_id": peer_id,
+                            "peer_ip": peer_ip, "typing": typing})
+
+    def delete_message(self, peer_id, row_id=None, msg_id=None):
+        self.client.request({"cmd": "delete_message", "peer_id": peer_id,
+                             "row_id": row_id, "msg_id": msg_id})
+
+    def clear_chat(self, peer_id):
+        self.client.request({"cmd": "clear_chat", "peer_id": peer_id})
+
     def call(self, peer_id, peer_ip, peer_name):
         reply = self.client.request({"cmd": "call", "peer_id": peer_id,
                                      "peer_ip": peer_ip, "peer_name": peer_name})
@@ -386,6 +407,7 @@ KV = """
 
 ScreenManager:
     SetupScreen:
+    PinScreen:
     UsersScreen:
     ChatScreen:
     CallScreen:
@@ -520,6 +542,70 @@ ScreenManager:
 
         Widget:
 
+<PinScreen>:
+    name: "pin"
+    BoxLayout:
+        orientation: "vertical"
+        padding: dp(32)
+        spacing: dp(14)
+        canvas.before:
+            Color:
+                rgba: 0.05, 0.045, 0.11, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        Widget:
+            size_hint_y: 0.28
+
+        Label:
+            text: "IP Phone"
+            font_size: dp(34)
+            bold: True
+            color: 0.72, 0.62, 1, 1
+            size_hint_y: None
+            height: dp(44)
+
+        Label:
+            text: "Enter your PIN to unlock"
+            color: 0.62, 0.60, 0.72, 1
+            size_hint_y: None
+            height: dp(24)
+
+        TextInput:
+            id: pin_input
+            password: True
+            multiline: False
+            input_filter: "int"
+            font_size: dp(26)
+            halign: "center"
+            size_hint: None, None
+            size: dp(180), dp(54)
+            pos_hint: {"center_x": 0.5}
+            padding: dp(10), dp(12)
+            background_normal: ""
+            background_active: ""
+            background_color: 0.115, 0.10, 0.21, 1
+            foreground_color: 0.96, 0.95, 1, 1
+            cursor_color: 0.72, 0.62, 1, 1
+            on_text_validate: root.try_unlock(pin_input.text)
+
+        Label:
+            id: pin_error
+            text: ""
+            color: 0.96, 0.34, 0.42, 1
+            size_hint_y: None
+            height: dp(20)
+
+        LuxButton:
+            text: "Unlock"
+            size_hint: None, None
+            size: dp(180), dp(48)
+            pos_hint: {"center_x": 0.5}
+            on_release: root.try_unlock(pin_input.text)
+
+        Widget:
+
 <UsersScreen>:
     name: "users"
     BoxLayout:
@@ -545,9 +631,16 @@ ScreenManager:
                 valign: "middle"
                 text_size: self.size
             GhostButton:
+                text: "PIN"
+                size_hint: None, None
+                width: dp(52)
+                height: dp(36)
+                pos_hint: {"center_y": 0.5}
+                on_release: root.show_pin_popup()
+            GhostButton:
                 text: "+ IP"
                 size_hint: None, None
-                width: dp(68)
+                width: dp(60)
                 height: dp(36)
                 pos_hint: {"center_y": 0.5}
                 on_release: root.show_add_ip_popup()
@@ -619,6 +712,11 @@ ScreenManager:
                 size_hint_x: None
                 width: dp(44)
                 on_release: root.show_fingerprint()
+            GhostButton:
+                text: "..."
+                size_hint_x: None
+                width: dp(40)
+                on_release: root.show_chat_menu()
             LuxButton:
                 text: "Call"
                 size_hint_x: None
@@ -668,6 +766,7 @@ ScreenManager:
                     hint_text_color: 0.55, 0.52, 0.66, 1
                     cursor_color: 0.72, 0.62, 1, 1
                     padding: dp(4), max(0, (self.height - self.line_height) / 2)
+                    on_text: root.on_typing_activity()
                     on_text_validate: root.on_send(chat_input.text)
             PillLuxButton:
                 text: "Send"
@@ -734,6 +833,20 @@ class SetupScreen(Screen):
             return
         app.set_display_name(name)
         self.manager.current = "users"
+
+
+class PinScreen(Screen):
+    def on_pre_enter(self):
+        self.ids.pin_input.text = ""
+        self.ids.pin_error.text = ""
+
+    def try_unlock(self, pin):
+        app = App.get_running_app()
+        if app.check_pin(pin.strip()):
+            app.unlock()
+        else:
+            self.ids.pin_error.text = "Wrong PIN - try again"
+            self.ids.pin_input.text = ""
 
 
 class Avatar(Label):
@@ -876,6 +989,72 @@ class UsersScreen(Screen):
         for peer in peers:
             container.add_widget(ContactRow(peer, self.open_chat, self.call_peer))
 
+    def show_pin_popup(self):
+        """Set, change, or remove the app PIN lock."""
+        app = App.get_running_app()
+
+        def pin_field(hint):
+            return TextInput(hint_text=hint, multiline=False, password=True,
+                             input_filter="int", size_hint_y=None,
+                             height=dp(44), padding=(dp(12), dp(12)),
+                             background_color=COLOR_CARD,
+                             foreground_color=COLOR_TEXT,
+                             hint_text_color=(0.55, 0.52, 0.66, 1),
+                             cursor_color=COLOR_LAVENDER)
+
+        content = BoxLayout(orientation="vertical", spacing=dp(8),
+                             padding=(dp(8), dp(8)))
+        current = pin_field("Current PIN") if app.has_pin() else None
+        new1 = pin_field("New PIN (4-8 digits)")
+        new2 = pin_field("Repeat new PIN")
+        error = Label(text="", font_size=dp(12), color=COLOR_DANGER,
+                       size_hint_y=None, height=dp(18))
+        save_btn = RoundButton(bg=COLOR_PRIMARY, text="Save PIN", bold=True,
+                                color=(1, 1, 1, 1), size_hint_y=None, height=dp(44))
+        remove_btn = RoundButton(bg=COLOR_DANGER, text="Remove PIN", bold=True,
+                                  color=(1, 1, 1, 1), size_hint_y=None, height=dp(44))
+
+        if current is not None:
+            content.add_widget(current)
+        content.add_widget(new1)
+        content.add_widget(new2)
+        content.add_widget(error)
+        content.add_widget(save_btn)
+        if app.has_pin():
+            content.add_widget(remove_btn)
+        popup = Popup(title="App PIN lock", content=content,
+                       size_hint=(0.9, None),
+                       height=dp(330 if app.has_pin() else 260))
+
+        def check_current():
+            if current is not None and not app.check_pin(current.text.strip()):
+                error.text = "Current PIN is wrong"
+                return False
+            return True
+
+        def do_save(*_a):
+            if not check_current():
+                return
+            pin = new1.text.strip()
+            if not (4 <= len(pin) <= 8):
+                error.text = "PIN must be 4-8 digits"
+                return
+            if pin != new2.text.strip():
+                error.text = "PINs don't match"
+                return
+            app.set_pin(pin)
+            popup.dismiss()
+
+        def do_remove(*_a):
+            if not check_current():
+                return
+            app.set_pin(None)
+            popup.dismiss()
+
+        save_btn.bind(on_release=do_save)
+        remove_btn.bind(on_release=do_remove)
+        popup.open()
+
     def show_add_ip_popup(self):
         """Manual fallback for networks where the router filters UDP
         broadcast, so devices never see each other automatically: type the
@@ -948,11 +1127,18 @@ class ChatBubble(BoxLayout):
     PAD_X = 12
     PAD_Y = 8
 
-    def __init__(self, text, mine, timestamp=None, status=None, **kwargs):
+    def __init__(self, text, mine, timestamp=None, status=None,
+                 msg_id=None, row_id=None, on_long_press=None, **kwargs):
         super().__init__(orientation="horizontal", size_hint_y=None,
                           padding=(dp(2), dp(1)), **kwargs)
         self._mine = mine
         self._status = status if mine else None
+        self.raw_text = text
+        self.msg_id = msg_id
+        self.row_id = row_id
+        self._on_long_press = on_long_press
+        self._lp_ev = None
+        self._lp_start = None
         self._base = escape_markup(text)
         self._stamp = ""
         if timestamp:
@@ -995,6 +1181,39 @@ class ChatBubble(BoxLayout):
         self._status = status
         self._label.text = self._compose()
         self._relayout()
+
+    # -- long-press (copy / delete menu) ---------------------------------
+    # A hold on the bubble for 0.45s without moving opens the context
+    # menu; any scroll motion cancels it so flicking the chat never
+    # triggers accidental menus.
+
+    def on_touch_down(self, touch):
+        if self._on_long_press and self._bubble.collide_point(*touch.pos):
+            self._lp_start = touch.pos
+            self._lp_ev = Clock.schedule_once(self._fire_long_press, 0.45)
+        return super().on_touch_down(touch)
+
+    def _fire_long_press(self, _dt):
+        self._lp_ev = None
+        if self._on_long_press:
+            self._on_long_press(self)
+
+    def _cancel_lp(self):
+        if self._lp_ev is not None:
+            self._lp_ev.cancel()
+            self._lp_ev = None
+
+    def on_touch_move(self, touch):
+        if self._lp_ev is not None and self._lp_start is not None:
+            dx = touch.pos[0] - self._lp_start[0]
+            dy = touch.pos[1] - self._lp_start[1]
+            if (dx * dx + dy * dy) ** 0.5 > dp(10):
+                self._cancel_lp()
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        self._cancel_lp()
+        return super().on_touch_up(touch)
 
     def _sync(self, *_args):
         self._rect.pos = self._bubble.pos
@@ -1120,14 +1339,27 @@ class ChatScreen(Screen):
     peer = None
     _last_day = None
     _bubbles = None
+    # typing indicator state
+    TYPING_RESEND = 4.0   # re-announce while still typing
+    TYPING_IDLE = 3.0     # silence after last keystroke -> "stopped"
+    TYPING_SHOW = 6.0     # hide their indicator if no refresh by then
+    _typing_sent = False
+    _typing_last = 0.0
+    _typing_off_ev = None
+    _typing_hide_ev = None
+    _base_status = ""
 
     def set_peer(self, peer):
         self.peer = peer
         self.peer_name = peer["name"]
         self.peer_online = bool(peer.get("online"))
-        self.peer_status = "Online" if self.peer_online else f"Last seen {format_last_seen(peer.get('last_seen'))}"
+        self._base_status = ("Online" if self.peer_online
+                             else f"Last seen {format_last_seen(peer.get('last_seen'))}")
+        self.peer_status = self._base_status
         self._last_day = None
         self._bubbles = {}  # msg_id -> ChatBubble (mine only, for receipts)
+        self._typing_sent = False
+        self._typing_last = 0.0
         self.ids.message_list.clear_widgets()
         self.load_history()
         App.get_running_app().set_viewing(peer)
@@ -1147,7 +1379,8 @@ class ChatScreen(Screen):
             if kind == "message":
                 mine = item["direction"] == "out"
                 self.append_message(item["text"], mine=mine, timestamp=item["timestamp"],
-                                    msg_id=item.get("msg_id"), status=item.get("status"))
+                                    msg_id=item.get("msg_id"), status=item.get("status"),
+                                    row_id=item.get("row_id"))
             elif kind == "call":
                 self.append_event(self._call_log_text(item), timestamp=item["timestamp"])
             elif kind == "file":
@@ -1196,6 +1429,7 @@ class ChatScreen(Screen):
         if not text:
             return
         app = App.get_running_app()
+        self._stop_typing_now()
         # The backend queues it (survives restarts and offline peers) and
         # tries to deliver right away. The bubble starts with the pending
         # "…" and upgrades to ticks as receipts come back.
@@ -1203,6 +1437,121 @@ class ChatScreen(Screen):
                                           self.peer["ip"], text)
         self.append_message(text, mine=True, msg_id=msg_id, status="pending")
         self.ids.chat_input.text = ""
+
+    # -- typing indicator (both directions) -------------------------------
+
+    def on_typing_activity(self):
+        """chat_input.on_text: announce 'typing' at most every
+        TYPING_RESEND seconds, and schedule the 'stopped' announcement."""
+        if not self.peer or not self.ids.chat_input.text:
+            return
+        app = App.get_running_app()
+        now = time.time()
+        if not self._typing_sent or now - self._typing_last > self.TYPING_RESEND:
+            self._typing_sent = True
+            self._typing_last = now
+            app.backend.send_typing(self.peer["id"], self.peer["ip"], True)
+        if self._typing_off_ev:
+            self._typing_off_ev.cancel()
+        self._typing_off_ev = Clock.schedule_once(
+            lambda dt: self._stop_typing_now(), self.TYPING_IDLE)
+
+    def _stop_typing_now(self):
+        if self._typing_off_ev:
+            self._typing_off_ev.cancel()
+            self._typing_off_ev = None
+        if self._typing_sent and self.peer:
+            App.get_running_app().backend.send_typing(
+                self.peer["id"], self.peer["ip"], False)
+        self._typing_sent = False
+
+    def receive_typing(self, peer_id, typing):
+        if not self.peer or peer_id != self.peer.get("id"):
+            return
+        if self._typing_hide_ev:
+            self._typing_hide_ev.cancel()
+            self._typing_hide_ev = None
+        if typing:
+            self.peer_status = "typing…"
+            # Their re-announcements keep pushing this back; if they go
+            # silent (or the 'stopped' packet is lost) it self-clears.
+            self._typing_hide_ev = Clock.schedule_once(
+                lambda dt: self._clear_typing(), self.TYPING_SHOW)
+        else:
+            self._clear_typing()
+
+    def _clear_typing(self):
+        self._typing_hide_ev = None
+        self.peer_status = self._base_status
+
+    # -- message context menu / clear chat --------------------------------
+
+    def _bubble_menu(self, bubble):
+        from kivy.core.clipboard import Clipboard
+        content = BoxLayout(orientation="vertical", spacing=dp(8),
+                             padding=(dp(8), dp(8)))
+        popup = Popup(title="Message", content=content,
+                       size_hint=(0.8, None), height=dp(230))
+
+        copy_btn = RoundButton(bg=COLOR_CARD, text="Copy text",
+                                color=COLOR_LAVENDER, bold=True,
+                                size_hint_y=None, height=dp(44))
+        delete_btn = RoundButton(bg=COLOR_DANGER, text="Delete message",
+                                  color=(1, 1, 1, 1), bold=True,
+                                  size_hint_y=None, height=dp(44))
+        cancel_btn = RoundButton(bg=COLOR_CARD, text="Cancel",
+                                  color=COLOR_TEXT_DIM, bold=True,
+                                  size_hint_y=None, height=dp(44))
+
+        def do_copy(*_a):
+            Clipboard.copy(bubble.raw_text)
+            popup.dismiss()
+
+        def do_delete(*_a):
+            app = App.get_running_app()
+            if bubble.msg_id or bubble.row_id is not None:
+                app.backend.delete_message(self.peer["id"],
+                                           row_id=bubble.row_id,
+                                           msg_id=bubble.msg_id)
+            if bubble.msg_id and self._bubbles:
+                self._bubbles.pop(bubble.msg_id, None)
+            self.ids.message_list.remove_widget(bubble)
+            popup.dismiss()
+
+        copy_btn.bind(on_release=do_copy)
+        delete_btn.bind(on_release=do_delete)
+        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
+        content.add_widget(copy_btn)
+        if bubble.msg_id or bubble.row_id is not None:
+            content.add_widget(delete_btn)
+        content.add_widget(cancel_btn)
+        popup.open()
+
+    def show_chat_menu(self):
+        content = BoxLayout(orientation="vertical", spacing=dp(8),
+                             padding=(dp(8), dp(8)))
+        popup = Popup(title=self.peer_name, content=content,
+                       size_hint=(0.8, None), height=dp(180))
+
+        clear_btn = RoundButton(bg=COLOR_DANGER, text="Clear chat history",
+                                 color=(1, 1, 1, 1), bold=True,
+                                 size_hint_y=None, height=dp(44))
+        cancel_btn = RoundButton(bg=COLOR_CARD, text="Cancel",
+                                  color=COLOR_TEXT_DIM, bold=True,
+                                  size_hint_y=None, height=dp(44))
+
+        def do_clear(*_a):
+            App.get_running_app().backend.clear_chat(self.peer["id"])
+            self.ids.message_list.clear_widgets()
+            self._last_day = None
+            self._bubbles = {}
+            popup.dismiss()
+
+        clear_btn.bind(on_release=do_clear)
+        cancel_btn.bind(on_release=lambda *_a: popup.dismiss())
+        content.add_widget(clear_btn)
+        content.add_widget(cancel_btn)
+        popup.open()
 
     def on_send_file(self):
         if platform == "android":
@@ -1262,10 +1611,13 @@ class ChatScreen(Screen):
             self._last_day = day
             self.ids.message_list.add_widget(DateChip(format_date_chip(ts)))
 
-    def append_message(self, text, mine, timestamp=None, msg_id=None, status=None):
+    def append_message(self, text, mine, timestamp=None, msg_id=None,
+                       status=None, row_id=None):
         ts = timestamp or time.time()
         self._maybe_date_chip(ts)
-        bubble = ChatBubble(text, mine, timestamp=ts, status=status)
+        bubble = ChatBubble(text, mine, timestamp=ts, status=status,
+                            msg_id=msg_id, row_id=row_id,
+                            on_long_press=self._bubble_menu)
         if mine and msg_id and self._bubbles is not None:
             self._bubbles[msg_id] = bubble
         self.ids.message_list.add_widget(bubble)
@@ -1373,7 +1725,11 @@ class CallScreen(Screen):
     def _return_to_users(self):
         if self.manager.current == "call":
             self.manager.transition = SlideTransition(direction="down")
-            self.manager.current = "users"
+            # A call may arrive while the app is PIN-locked (answering
+            # doesn't need the PIN) - but the rest of the app still does.
+            app = App.get_running_app()
+            self.manager.current = ("pin" if getattr(app, "_locked", False)
+                                    and app.has_pin() else "users")
 
     def on_accept(self):
         App.get_running_app().backend.accept_call()
@@ -1397,6 +1753,8 @@ class LancomApp(App):
         self.backend = None
         self._is_foreground = True
         self._viewing_peer = None
+        self._locked = False
+        self._paused_at = 0.0
         self.profile_store = JsonStore(self.user_data_dir + "/lancom.json")
 
         self.identity = crypto_util.Identity.load_or_create(
@@ -1432,15 +1790,46 @@ class LancomApp(App):
             name = self.profile_store.get("profile").get("name", "")
             if name:
                 self.set_display_name(name)
-                self.root.current = "users"
+                if self.has_pin():
+                    self._locked = True
+                    self.root.current = "pin"
+                else:
+                    self.root.current = "users"
                 return
         self.root.current = "setup"
+
+    # -- PIN lock ---------------------------------------------------------
+
+    LOCK_AFTER = 60.0  # re-lock when paused longer than this
+
+    def has_pin(self):
+        return self.profile_store.exists("pinlock")
+
+    def check_pin(self, pin):
+        if not self.has_pin():
+            return True
+        rec = self.profile_store.get("pinlock")
+        digest = hashlib.sha256((rec["salt"] + pin).encode("utf-8")).hexdigest()
+        return digest == rec["hash"]
+
+    def set_pin(self, pin):
+        if pin:
+            salt = os.urandom(8).hex()
+            digest = hashlib.sha256((salt + pin).encode("utf-8")).hexdigest()
+            self.profile_store.put("pinlock", salt=salt, hash=digest)
+        elif self.has_pin():
+            self.profile_store.delete("pinlock")
+
+    def unlock(self):
+        self._locked = False
+        self.root.current = "users"
 
     def on_pause(self):
         # The UI may sleep - the SERVICE keeps communicating. Just tell it
         # we're no longer visible so it starts notifying instead of
         # assuming the user sees the screen.
         self._is_foreground = False
+        self._paused_at = time.time()
         if self.backend:
             self.backend.set_view(False, self._viewing_peer)
         return True
@@ -1455,6 +1844,13 @@ class LancomApp(App):
                 chat = self.root.get_screen("chat")
                 if chat.peer:
                     self.backend.chat_opened(chat.peer["id"], chat.peer.get("ip"))
+        # Re-lock after a real absence, not a quick app switch. Never
+        # steal the screen from an in-progress call.
+        if (self.has_pin()
+                and time.time() - getattr(self, "_paused_at", 0) > self.LOCK_AFTER
+                and self.root.current != "call"):
+            self._locked = True
+            self.root.current = "pin"
 
     def set_viewing(self, peer):
         """ChatScreen tells us which conversation is on screen (or None).
@@ -1487,6 +1883,10 @@ class LancomApp(App):
             if self.root.current == "chat":
                 self.root.get_screen("chat").update_message_status(
                     ev.get("msg_id"), ev.get("status"))
+        elif kind == "typing":
+            if self.root.current == "chat":
+                self.root.get_screen("chat").receive_typing(
+                    ev.get("peer_id"), ev.get("typing"))
         elif kind == "call":
             self._dispatch_call_event(ev.get("event", {}))
         elif kind == "file":

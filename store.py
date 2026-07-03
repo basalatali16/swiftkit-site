@@ -165,16 +165,41 @@ class Store:
     def get_messages(self, peer_id, limit=300):
         with self._lock:
             cur = self._conn.execute(
-                "SELECT direction, text, timestamp, msg_id, status FROM messages "
-                "WHERE peer_id=? ORDER BY timestamp ASC LIMIT ?",
+                "SELECT direction, text, timestamp, msg_id, status, id "
+                "FROM messages WHERE peer_id=? ORDER BY timestamp ASC LIMIT ?",
                 (peer_id, limit),
             )
             rows = cur.fetchall()
         return [
             {"direction": r[0], "text": self._unseal(r[1]), "timestamp": r[2],
-             "msg_id": r[3], "status": r[4] or ""}
+             "msg_id": r[3], "status": r[4] or "", "row_id": r[5]}
             for r in rows
         ]
+
+    def delete_message(self, peer_id, row_id=None, msg_id=None):
+        """Delete one message locally ("delete for me"). Also removes any
+        outbox entry so a deleted still-pending message never gets sent."""
+        with self._lock:
+            if msg_id:
+                self._conn.execute("DELETE FROM outbox WHERE msg_id=?", (msg_id,))
+                self._conn.execute(
+                    "DELETE FROM messages WHERE peer_id=? AND msg_id=?",
+                    (peer_id, msg_id))
+            elif row_id is not None:
+                self._conn.execute(
+                    "DELETE FROM messages WHERE peer_id=? AND id=?",
+                    (peer_id, row_id))
+            self._conn.commit()
+
+    def clear_chat(self, peer_id):
+        """Wipe the whole local timeline with one contact - messages, call
+        log, and file records. Files already saved to disk stay there."""
+        with self._lock:
+            self._conn.execute("DELETE FROM outbox WHERE peer_id=?", (peer_id,))
+            self._conn.execute("DELETE FROM messages WHERE peer_id=?", (peer_id,))
+            self._conn.execute("DELETE FROM call_log WHERE peer_id=?", (peer_id,))
+            self._conn.execute("DELETE FROM files WHERE peer_id=?", (peer_id,))
+            self._conn.commit()
 
     def has_message(self, peer_id, msg_id):
         if not msg_id:

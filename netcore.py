@@ -654,11 +654,13 @@ class MessageServer:
     "seen" when the chat is actually on screen. Receipts are idempotent
     and deduplicated by msg_id, so retries never duplicate a message."""
 
-    def __init__(self, display_name, store, on_message, on_receipt=None, port=None):
+    def __init__(self, display_name, store, on_message, on_receipt=None,
+                 on_typing=None, port=None):
         self.display_name = display_name
         self.store = store
         self.on_message = on_message
         self.on_receipt = on_receipt  # callback(msg_id, status) - worker thread
+        self.on_typing = on_typing  # callback(peer_id, bool) - worker thread
         self.port = port or MESSAGE_PORT
         self._running = False
         self._flush_locks = {}  # peer_id -> Lock: one flush per peer at a time
@@ -708,6 +710,13 @@ class MessageServer:
                         self.on_receipt(mid, kind)
                 return
 
+            if msg_type == "TYPING":
+                # Ephemeral - never stored, never notified, just relayed
+                # to the UI if it's watching this chat.
+                if self.on_typing:
+                    self.on_typing(sender_id, bool(msg.get("typing")))
+                return
+
             if msg_type != "MSG":
                 return
             msg_id = msg.get("msg_id")
@@ -749,6 +758,22 @@ class MessageServer:
             threading.Thread(target=do, daemon=True).start()
         else:
             do()
+
+    def send_typing(self, peer_id, peer_ip, typing):
+        """Fire-and-forget typing state: best-effort, short timeout, no
+        retries - a lost one just means no indicator for a moment."""
+        def do():
+            pubkey_b64 = self.store.get_peer_pubkey(peer_id)
+            if not pubkey_b64 or not peer_ip:
+                return
+            try:
+                send_encrypted_tcp(peer_ip, MESSAGE_PORT,
+                                   {"type": "TYPING", "typing": bool(typing)},
+                                   base64.b64decode(pubkey_b64), timeout=1.5)
+            except OSError:
+                pass
+
+        threading.Thread(target=do, daemon=True).start()
 
     def queue_message(self, peer_id, peer_name, text):
         """Store the message as pending and enqueue it. Returns the
@@ -1497,7 +1522,8 @@ class NetworkCore:
                                         on_peer_online=self._peer_online)
         self.message_server = MessageServer(display_name, self.store,
                                              self._message,
-                                             on_receipt=self._receipt)
+                                             on_receipt=self._receipt,
+                                             on_typing=self._typing)
         self.call_manager = CallManager(display_name, self.store, self._call_event)
         files_dir = os.path.join(self.data_dir, "received_files")
         self.file_manager = FileTransferManager(display_name, self.store,
@@ -1529,6 +1555,9 @@ class NetworkCore:
 
     def _receipt(self, msg_id, status):
         self._emit({"kind": "receipt", "msg_id": msg_id, "status": status})
+
+    def _typing(self, peer_id, typing):
+        self._emit({"kind": "typing", "peer_id": peer_id, "typing": typing})
 
     def _call_event(self, event):
         self._emit({"kind": "call", "event": event})
@@ -1565,6 +1594,16 @@ class NetworkCore:
         self.store.mark_seen_receipts_sent(peer_id, msg_ids)
         self.message_server.send_receipt(peer_id, peer_ip, msg_ids, "seen",
                                          background=True)
+
+    def send_typing(self, peer_id, peer_ip, typing):
+        if self.message_server:
+            self.message_server.send_typing(peer_id, peer_ip, typing)
+
+    def delete_message(self, peer_id, row_id=None, msg_id=None):
+        self.store.delete_message(peer_id, row_id=row_id, msg_id=msg_id)
+
+    def clear_chat(self, peer_id):
+        self.store.clear_chat(peer_id)
 
     def probe_ip(self, ip):
         return self.discovery.probe_ip(ip) if self.discovery else False

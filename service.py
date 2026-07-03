@@ -87,6 +87,16 @@ def handle_command(cmd):
     if op == "chat_opened":
         core.chat_opened(cmd["peer_id"], cmd.get("peer_ip"))
         return {"ok": True}
+    if op == "typing":
+        core.send_typing(cmd["peer_id"], cmd.get("peer_ip"), cmd.get("typing"))
+        return {"ok": True}
+    if op == "delete_message":
+        core.delete_message(cmd["peer_id"], row_id=cmd.get("row_id"),
+                            msg_id=cmd.get("msg_id"))
+        return {"ok": True}
+    if op == "clear_chat":
+        core.clear_chat(cmd["peer_id"])
+        return {"ok": True}
     if op == "probe_ip":
         return {"ok": bool(core.probe_ip(cmd["ip"]))}
     if op == "call":

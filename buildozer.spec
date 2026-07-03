@@ -10,7 +10,7 @@ package.domain = com.localnet
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 
-version = 0.6
+version = 0.7
 
 # The entire networking stack runs in this sticky foreground service
 # (service.py), so messages/calls/files keep arriving with the app
