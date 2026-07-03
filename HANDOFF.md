@@ -177,6 +177,35 @@ screenshots. NOT yet verified on a phone.
 Data-path note: both processes resolve the same files dir (Kivy
 user_data_dir == ANDROID_PRIVATE on android), so identity/DB carry over.
 
+## Session end state (2026-07-03 ~23:55 local, owner hit usage limit)
+
+Owner asked to auto-continue when their limit resets (Sat 2026-07-04
+~03:09 local). A one-time scheduled task handles the resume.
+
+Where things stand RIGHT NOW:
+- Build #21 (run id 28678453829) = v0.7.1 FINAL Android APK was
+  in_progress when the session ended. It contains EVERYTHING: sticky
+  foreground service, real call ringing + missed/no-answer timeouts,
+  IP Phone rebrand (icon/presplash/violet-teal palette), typing
+  indicators, long-press delete + copy + clear chat, PIN lock, and
+  contact-details view with device model. Builds #19 (green) and #20
+  are superseded - ignore them.
+- FIRST ACTION on resume: check run 28678453829 conclusion via the
+  GitHub API (unauthenticated works). If green: give the owner the
+  artifact link + the v0.7.1 test checklist (typing, delete, clear,
+  PIN incl. answer-call-while-locked, contact details device model,
+  ringing regression). If red: read job logs before changing anything.
+- Owner has NOT yet device-tested v0.7.x. Waiting on their report.
+- NEXT MILESTONE (owner-confirmed order): after the owner confirms the
+  final APK on both phones -> build the WINDOWS PC app. netcore.py is
+  already Kivy-free and desktop-capable; lancom_app runs on desktop via
+  DirectBackend. Plan: package UI+core for Windows (PyInstaller),
+  desktop-appropriate window sizing, tray/notifications later.
+  device_label() already reports computer name for desktop builds.
+- Owner communication style: short bullet requests, tests on real
+  phones, sends screenshots (sometimes forgets the attachment - ask
+  them to re-send if a referenced image is missing).
+
 ## Next steps
 
 1. A new CI build was pushed after these changes — check its result on
