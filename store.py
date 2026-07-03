@@ -77,15 +77,28 @@ class Store:
                     salt TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS outbox (
+                    msg_id TEXT PRIMARY KEY,
+                    peer_id TEXT NOT NULL,
+                    created REAL NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_messages_peer ON messages(peer_id);
                 CREATE INDEX IF NOT EXISTS idx_calllog_peer ON call_log(peer_id);
                 CREATE INDEX IF NOT EXISTS idx_files_peer ON files(peer_id);
             """)
-            # Upgrading an older DB that predates the pubkey column.
-            try:
-                self._conn.execute("ALTER TABLE peers ADD COLUMN pubkey TEXT")
-            except sqlite3.OperationalError:
-                pass
+            # Upgrading older DBs that predate these columns.
+            for ddl in (
+                "ALTER TABLE peers ADD COLUMN pubkey TEXT",
+                "ALTER TABLE messages ADD COLUMN msg_id TEXT",
+                # Outgoing: '' (pre-status rows) | pending | delivered | seen.
+                "ALTER TABLE messages ADD COLUMN status TEXT DEFAULT ''",
+                # Incoming: whether we've told the sender we displayed it.
+                "ALTER TABLE messages ADD COLUMN seen_receipt_sent INTEGER DEFAULT 0",
+            ):
+                try:
+                    self._conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
             self._conn.commit()
 
     def _seal(self, plaintext):
@@ -133,13 +146,14 @@ class Store:
 
     # -- messages -----------------------------------------------------------
 
-    def add_message(self, peer_id, peer_name, direction, text):
+    def add_message(self, peer_id, peer_name, direction, text,
+                    msg_id=None, status=""):
         ts = time.time()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO messages (peer_id, peer_name, direction, text, timestamp) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (peer_id, peer_name, direction, self._seal(text), ts),
+                "INSERT INTO messages (peer_id, peer_name, direction, text, "
+                "timestamp, msg_id, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (peer_id, peer_name, direction, self._seal(text), ts, msg_id, status),
             )
             self._conn.commit()
         return ts
@@ -147,15 +161,83 @@ class Store:
     def get_messages(self, peer_id, limit=300):
         with self._lock:
             cur = self._conn.execute(
-                "SELECT direction, text, timestamp FROM messages "
+                "SELECT direction, text, timestamp, msg_id, status FROM messages "
                 "WHERE peer_id=? ORDER BY timestamp ASC LIMIT ?",
                 (peer_id, limit),
             )
             rows = cur.fetchall()
         return [
-            {"direction": r[0], "text": self._unseal(r[1]), "timestamp": r[2]}
+            {"direction": r[0], "text": self._unseal(r[1]), "timestamp": r[2],
+             "msg_id": r[3], "status": r[4] or ""}
             for r in rows
         ]
+
+    def has_message(self, peer_id, msg_id):
+        if not msg_id:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT 1 FROM messages WHERE peer_id=? AND msg_id=? LIMIT 1",
+                (peer_id, msg_id))
+            return cur.fetchone() is not None
+
+    def set_message_status(self, msg_id, status):
+        """Upgrade an outgoing message's status. 'seen' beats 'delivered'
+        beats 'pending' - receipts can arrive out of order, never downgrade."""
+        rank = {"": 0, "pending": 1, "delivered": 2, "seen": 3}
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT status FROM messages WHERE msg_id=?", (msg_id,))
+            row = cur.fetchone()
+            if row is None or rank.get(status, 0) <= rank.get(row[0] or "", 0):
+                return False
+            self._conn.execute(
+                "UPDATE messages SET status=? WHERE msg_id=?", (status, msg_id))
+            self._conn.commit()
+            return True
+
+    def get_unseen_incoming_ids(self, peer_id):
+        """Incoming messages we haven't sent a 'seen' receipt for yet."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT msg_id FROM messages WHERE peer_id=? AND direction='in' "
+                "AND msg_id IS NOT NULL AND seen_receipt_sent=0", (peer_id,))
+            return [r[0] for r in cur.fetchall()]
+
+    def mark_seen_receipts_sent(self, peer_id, msg_ids):
+        if not msg_ids:
+            return
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE messages SET seen_receipt_sent=1 "
+                "WHERE peer_id=? AND msg_id=?",
+                [(peer_id, mid) for mid in msg_ids])
+            self._conn.commit()
+
+    # -- outbox (store-and-forward for offline peers) --------------------
+
+    def outbox_add(self, msg_id, peer_id):
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO outbox (msg_id, peer_id, created) "
+                "VALUES (?, ?, ?)", (msg_id, peer_id, time.time()))
+            self._conn.commit()
+
+    def outbox_remove(self, msg_id):
+        with self._lock:
+            self._conn.execute("DELETE FROM outbox WHERE msg_id=?", (msg_id,))
+            self._conn.commit()
+
+    def outbox_pending(self, peer_id):
+        """Queued messages for one peer, oldest first, with their text."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT o.msg_id, m.text, m.timestamp FROM outbox o "
+                "JOIN messages m ON m.msg_id = o.msg_id "
+                "WHERE o.peer_id=? ORDER BY m.timestamp ASC", (peer_id,))
+            rows = cur.fetchall()
+        return [{"msg_id": r[0], "text": self._unseal(r[1]), "timestamp": r[2]}
+                for r in rows]
 
     # -- call log -------------------------------------------------------
 

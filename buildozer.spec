@@ -7,7 +7,7 @@ package.domain = com.localnet
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 
-version = 0.2.1
+version = 0.3
 
 # Kivy 2.3.1 added support for newer CPython (3.13+), which matches the
 # Python version python-for-android currently bundles by default. Pinning
@@ -29,7 +29,11 @@ presplash.filename = %(source.dir)s/assets/presplash.png
 # Matches the presplash/app background so the splash doesn't flash white.
 android.presplash_color = #060810
 
-android.permissions = INTERNET,RECORD_AUDIO,ACCESS_WIFI_STATE,ACCESS_NETWORK_STATE,MODIFY_AUDIO_SETTINGS,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,POST_NOTIFICATIONS
+# WAKE_LOCK + CHANGE_WIFI_MULTICAST_STATE: required for the background
+# locks (android_notify.acquire_background_locks) that keep discovery and
+# message delivery working with the screen off. Both are install-time
+# permissions - no user prompt.
+android.permissions = INTERNET,RECORD_AUDIO,ACCESS_WIFI_STATE,ACCESS_NETWORK_STATE,MODIFY_AUDIO_SETTINGS,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,POST_NOTIFICATIONS,WAKE_LOCK,CHANGE_WIFI_MULTICAST_STATE
 
 android.api = 34
 android.minapi = 24

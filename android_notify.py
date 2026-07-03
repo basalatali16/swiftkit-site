@@ -19,6 +19,53 @@ from kivy.utils import platform
 CHANNEL_MESSAGES = "lancom_messages"
 CHANNEL_CALLS = "lancom_calls"
 
+# Locks held for the app's lifetime (never released on purpose) - kept
+# here so the GC can't collect them, which would release them.
+_held_locks = []
+
+
+def acquire_background_locks():
+    """Grab the three locks a LAN communicator needs on Android:
+
+    - MulticastLock: without it Android silently DROPS incoming UDP
+      broadcast packets on most devices - discovery can fail even in the
+      foreground. This one is not optional for this app.
+    - WifiLock (FULL_HIGH_PERF): keeps WiFi awake and out of power-save
+      when the screen goes off, so messages/calls still arrive.
+    - Partial WakeLock: keeps the CPU serviceable in the background so
+      the listener threads actually run.
+
+    Deliberately never released: LANCOM's whole job is to be reachable.
+    The battery cost is the documented trade-off, softened by the
+    battery-optimization exemption the app already asks for."""
+    if platform != "android" or _held_locks:
+        return
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        Context = autoclass("android.content.Context")
+        PowerManager = autoclass("android.os.PowerManager")
+        app_ctx = PythonActivity.mActivity.getApplicationContext()
+
+        wifi = app_ctx.getSystemService(Context.WIFI_SERVICE)
+        multicast = wifi.createMulticastLock("lancom:multicast")
+        multicast.setReferenceCounted(False)
+        multicast.acquire()
+        _held_locks.append(multicast)
+
+        wifi_lock = wifi.createWifiLock(3, "lancom:wifi")  # 3 = WIFI_MODE_FULL_HIGH_PERF
+        wifi_lock.setReferenceCounted(False)
+        wifi_lock.acquire()
+        _held_locks.append(wifi_lock)
+
+        power = app_ctx.getSystemService(Context.POWER_SERVICE)
+        wake = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "lancom:net")
+        wake.setReferenceCounted(False)
+        wake.acquire()
+        _held_locks.append(wake)
+    except Exception:
+        pass  # degraded background behavior beats crashing the app
+
 
 def _get_notification_manager():
     from jnius import autoclass, cast
@@ -64,6 +111,19 @@ def _notify(channel_id, channel_name, title, text, notif_id, ringtone=False):
         builder.setSmallIcon(activity.getApplicationInfo().icon)
         builder.setAutoCancel(True)
         builder.setPriority(2)  # Notification.PRIORITY_MAX, ignored on API 26+ (channel importance rules instead)
+
+        # Tapping the notification brings LANCOM to the foreground
+        # (or launches it) instead of doing nothing.
+        Intent = autoclass("android.content.Intent")
+        PendingIntent = autoclass("android.app.PendingIntent")
+        intent = Intent(activity, activity.getClass())
+        intent.setAction(Intent.ACTION_MAIN)
+        intent.addCategory(Intent.CATEGORY_LAUNCHER)
+        intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        pending = PendingIntent.getActivity(
+            activity, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
+        builder.setContentIntent(pending)
 
         sound_type = RingtoneManager.TYPE_RINGTONE if ringtone else RingtoneManager.TYPE_NOTIFICATION
         builder.setSound(RingtoneManager.getDefaultUri(sound_type))

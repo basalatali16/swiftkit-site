@@ -23,6 +23,7 @@ import socket
 import struct
 import threading
 import time
+import uuid
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -30,6 +31,7 @@ from kivy.graphics import Color, Ellipse, RoundedRectangle
 from kivy.lang import Builder
 from kivy.metrics import dp
 from kivy.properties import StringProperty, BooleanProperty
+from kivy.resources import resource_find
 from kivy.storage.jsonstore import JsonStore
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -73,6 +75,30 @@ COLOR_OFFLINE = (0.46, 0.46, 0.52, 1)
 COLOR_DANGER = (0.80, 0.28, 0.28, 1)
 COLOR_BUBBLE_MINE = (0.27, 0.22, 0.12, 1)  # own messages - warm gold-dark
 COLOR_CHIP = (0.10, 0.115, 0.17, 1)  # date separator chips
+
+# Kivy's default Roboto has no check-mark glyph (U+2713 renders as a
+# hollow box), but Kivy also bundles DejaVuSans which does - the message
+# status ticks switch to it via a [font=...] markup tag. The fonts dir
+# isn't on Kivy's resource path, so resolve it against the package.
+import kivy as _kivy  # noqa: E402  (kivy already imported via submodules)
+
+TICK_FONT = os.path.join(os.path.dirname(_kivy.__file__),
+                         "data", "fonts", "DejaVuSans.ttf")
+if not os.path.exists(TICK_FONT):
+    TICK_FONT = resource_find("DejaVuSans.ttf")  # last-ditch fallback
+
+
+def ticks_markup(status):
+    """WhatsApp-style status suffix for an outgoing bubble: '…' queued,
+    dim double-check delivered, gold double-check seen."""
+    if status == "pending":
+        return " [color=#8d8d99]…[/color]"
+    if status in ("delivered", "seen"):
+        color = "#d8b26c" if status == "seen" else "#8d8d99"
+        if TICK_FONT:
+            return f" [color={color}][font={TICK_FONT}]✓✓[/font][/color]"
+        return f" [color={color}]✓✓[/color]"
+    return ""
 
 AVATAR_COLORS = [
     (0.72, 0.45, 0.20), (0.30, 0.48, 0.75), (0.52, 0.36, 0.75),
@@ -187,6 +213,38 @@ def resolve_android_content_uri(uri_str, dest_dir):
         input_stream.close()
 
     return dest_path
+
+
+def android_pick_file(callback):
+    """Open Android's system document picker (Storage Access Framework,
+    ACTION_OPEN_DOCUMENT). Needs no storage permission on ANY Android
+    version - the system UI hands us a content:// URI for just the file
+    the user chose. callback(uri_string) runs on the Kivy main thread."""
+    from android import activity as android_activity
+    from jnius import autoclass
+
+    Intent = autoclass("android.content.Intent")
+    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+    RESULT_OK = -1
+    request_code = 0x4C46  # "LF" - LANCOM file
+
+    def on_result(request, result, data):
+        if request != request_code:
+            return
+        android_activity.unbind(on_activity_result=on_result)
+        if result != RESULT_OK or data is None:
+            return
+        uri = data.getData()
+        if uri is None:
+            return
+        uri_str = uri.toString()
+        Clock.schedule_once(lambda dt: callback(uri_str), 0)
+
+    android_activity.bind(on_activity_result=on_result)
+    intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+    intent.addCategory(Intent.CATEGORY_OPENABLE)
+    intent.setType("*/*")
+    PythonActivity.mActivity.startActivityForResult(intent, request_code)
 
 
 def get_local_ip():
@@ -495,9 +553,12 @@ else:
 # ---------------------------------------------------------------------------
 
 class PeerDiscovery:
-    def __init__(self, display_name, store):
+    def __init__(self, display_name, store, on_peer_online=None):
         self.display_name = display_name
         self.store = store
+        # Called (from the listener thread) when a peer we didn't have
+        # live appears - the app uses it to flush queued messages.
+        self.on_peer_online = on_peer_online
         self.local_ip = get_local_ip()
         self.broadcast_ip = get_broadcast_ip(self.local_ip)
         self.peers = {}  # device_id -> {"name", "ip", "last_seen"} (currently live only)
@@ -619,6 +680,7 @@ class PeerDiscovery:
             peer_id = msg["id"]
             name = msg.get("name", "Unknown")
             with self._lock:
+                came_online = peer_id not in self.peers
                 self.peers[peer_id] = {
                     "id": peer_id,
                     "name": name,
@@ -627,6 +689,11 @@ class PeerDiscovery:
                     "last_seen": time.time(),
                 }
             self.store.upsert_peer(peer_id, name, addr[0], pubkey_b64)
+            if came_online and self.on_peer_online:
+                try:
+                    self.on_peer_online(peer_id, addr[0])
+                except Exception:
+                    pass
             if msg.get("probe"):
                 # A directed probe means our broadcasts likely never reach
                 # this device - answer straight back to the packet's source
@@ -678,11 +745,26 @@ class PeerDiscovery:
 # ---------------------------------------------------------------------------
 
 class MessageServer:
-    def __init__(self, display_name, store, on_message):
+    """Messaging with store-and-forward. Outgoing messages always go
+    through the outbox: queue_message() records them as "pending", and
+    flush_outbox() tries to deliver everything queued for a peer, oldest
+    first. Flushes run on send, and whenever discovery sees the peer come
+    online - so a message typed while the other device was away arrives
+    by itself once both are back on the same network.
+
+    Delivery/read receipts ride the same port as messages (type RECEIPT):
+    the receiver confirms "delivered" as soon as it stores a message and
+    "seen" when the chat is actually on screen. Receipts are idempotent
+    and deduplicated by msg_id, so retries never duplicate a message."""
+
+    def __init__(self, display_name, store, on_message, on_receipt=None, port=None):
         self.display_name = display_name
         self.store = store
         self.on_message = on_message
+        self.on_receipt = on_receipt  # callback(msg_id, status) - worker thread
+        self.port = port or MESSAGE_PORT
         self._running = False
+        self._flush_locks = {}  # peer_id -> Lock: one flush per peer at a time
 
     def start(self):
         self._running = True
@@ -694,7 +776,7 @@ class MessageServer:
     def _listen_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("", MESSAGE_PORT))
+        sock.bind(("", self.port))
         sock.listen(5)
         sock.settimeout(1.0)
         while self._running:
@@ -715,27 +797,105 @@ class MessageServer:
                 return
             if not msg:
                 return
-            msg["ip"] = addr[0]
             # _sender_id is authenticated by successful decryption - trust
             # it over any from_id the JSON body itself might claim.
             sender_id = msg["_sender_id"]
-            self.store.add_message(sender_id, msg.get("from_name", "Unknown"),
-                                    "in", msg.get("text", ""))
+            msg_type = msg.get("type")
+
+            if msg_type == "RECEIPT":
+                kind = msg.get("kind")
+                if kind not in ("delivered", "seen"):
+                    return
+                for mid in msg.get("msg_ids", []):
+                    if self.store.set_message_status(mid, kind) and self.on_receipt:
+                        self.on_receipt(mid, kind)
+                return
+
+            if msg_type != "MSG":
+                return
+            msg_id = msg.get("msg_id")
+            duplicate = self.store.has_message(sender_id, msg_id)
+            if not duplicate:
+                self.store.add_message(sender_id, msg.get("from_name", "Unknown"),
+                                        "in", msg.get("text", ""), msg_id=msg_id)
+            # Confirm delivery even for duplicates - a resend means the
+            # sender never got (or lost) the first receipt.
+            if msg_id:
+                self.send_receipt(sender_id, addr[0], [msg_id], "delivered",
+                                  background=True)
+            if duplicate:
+                return
+            msg["ip"] = addr[0]
             msg["from_id"] = sender_id
             self.on_message(msg)
 
-    def send_message(self, peer_id, peer_name, peer_ip, text):
-        pubkey_b64 = self.store.get_peer_pubkey(peer_id)
-        if not pubkey_b64:
-            raise OSError(f"no known public key for peer {peer_id}")
-        self.store.add_message(peer_id, peer_name, "out", text)
-        payload = {
-            "type": "MSG",
-            "from_name": self.display_name,
-            "text": text,
-            "timestamp": time.time(),
-        }
-        send_encrypted_tcp(peer_ip, MESSAGE_PORT, payload, base64.b64decode(pubkey_b64))
+    def send_receipt(self, peer_id, peer_ip, msg_ids, kind, background=False):
+        """Best-effort: a lost 'delivered' recovers on resend, a lost
+        'seen' just leaves the sender at double-gray ticks."""
+        msg_ids = [m for m in msg_ids if m]
+        if not msg_ids or not peer_ip:
+            return
+
+        def do():
+            pubkey_b64 = self.store.get_peer_pubkey(peer_id)
+            if not pubkey_b64:
+                return
+            try:
+                send_encrypted_tcp(peer_ip, MESSAGE_PORT,
+                                   {"type": "RECEIPT", "kind": kind,
+                                    "msg_ids": msg_ids},
+                                   base64.b64decode(pubkey_b64))
+            except OSError:
+                pass
+
+        if background:
+            threading.Thread(target=do, daemon=True).start()
+        else:
+            do()
+
+    def queue_message(self, peer_id, peer_name, text):
+        """Store the message as pending and enqueue it. Returns the
+        msg_id. Actual delivery happens via flush_outbox()."""
+        msg_id = uuid.uuid4().hex[:16]
+        self.store.add_message(peer_id, peer_name, "out", text,
+                                msg_id=msg_id, status="pending")
+        self.store.outbox_add(msg_id, peer_id)
+        return msg_id
+
+    def flush_outbox(self, peer_id, peer_ip=None):
+        """Deliver everything queued for one peer, oldest first. Blocking -
+        call from a background thread. Stops at the first failure so
+        ordering is preserved; the next flush picks up from there."""
+        lock = self._flush_locks.setdefault(peer_id, threading.Lock())
+        if not lock.acquire(blocking=False):
+            return  # already flushing this peer
+        try:
+            pubkey_b64 = self.store.get_peer_pubkey(peer_id)
+            if not pubkey_b64:
+                return
+            if peer_ip is None:
+                for p in self.store.get_known_peers():
+                    if p["id"] == peer_id:
+                        peer_ip = p["ip"]
+                        break
+            if not peer_ip:
+                return
+            peer_pubkey = base64.b64decode(pubkey_b64)
+            for item in self.store.outbox_pending(peer_id):
+                payload = {
+                    "type": "MSG",
+                    "msg_id": item["msg_id"],
+                    "from_name": self.display_name,
+                    "text": item["text"],
+                    "timestamp": item["timestamp"],
+                }
+                try:
+                    send_encrypted_tcp(peer_ip, MESSAGE_PORT, payload, peer_pubkey)
+                except OSError:
+                    break
+                self.store.outbox_remove(item["msg_id"])
+        finally:
+            lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +1011,7 @@ class CallManager:
             # authenticated (forging it would derive the wrong decryption
             # key), unlike the IP-based check this used to rely on, which a
             # device on the same LAN could spoof.
+            reject_reason = ""
             with self._lock:
                 from_current_peer = self.peer_id is not None and sender_id == self.peer_id
                 peer_id, peer_name, direction = self.peer_id, self.peer_name, self._direction
@@ -862,6 +1023,7 @@ class CallManager:
                     self._log_call(peer_id, peer_name, direction, "rejected")
                     self._reset_to_idle()
                     action = "rejected"
+                    reject_reason = msg.get("reason", "")
                 elif msg_type == "HANGUP" and from_current_peer and self.state in ("active", "ringing", "calling"):
                     outcome = "completed" if self._call_start else (
                         "missed" if direction == "in" else "cancelled")
@@ -875,7 +1037,8 @@ class CallManager:
                 self._start_audio()
                 self.on_event({"event": "call_active", "peer_name": peer_name})
             elif action == "rejected":
-                self.on_event({"event": "call_rejected", "peer_name": peer_name})
+                self.on_event({"event": "call_rejected", "peer_name": peer_name,
+                                "reason": reject_reason})
             elif action == "ended":
                 self._stop_audio()
                 self.on_event({"event": "call_ended", "peer_name": peer_name})
@@ -913,6 +1076,14 @@ class CallManager:
                         self._log_call(peer_id, peer_name, "out", "failed")
                         self._reset_to_idle()
                 self.on_event({"event": "call_failed", "peer_name": peer_name})
+                return
+            # The invite reached the device, so it's now ringing there -
+            # distinct from "unreachable" so the caller can tell whether
+            # the other side is getting the call at all.
+            with self._lock:
+                ringing = self.state == "calling" and self.peer_ip == peer_ip
+            if ringing:
+                self.on_event({"event": "call_ringing", "peer_name": peer_name})
 
         threading.Thread(target=send_invite, daemon=True).start()
         return True
@@ -1885,15 +2056,18 @@ class ChatBubble(BoxLayout):
     PAD_X = 12
     PAD_Y = 8
 
-    def __init__(self, text, mine, timestamp=None, **kwargs):
+    def __init__(self, text, mine, timestamp=None, status=None, **kwargs):
         super().__init__(orientation="horizontal", size_hint_y=None,
                           padding=(dp(2), dp(1)), **kwargs)
-        body = escape_markup(text)
+        self._mine = mine
+        self._status = status if mine else None
+        self._base = escape_markup(text)
+        self._stamp = ""
         if timestamp:
-            body += (f" [size={int(dp(10))}][color=#9a93a4]"
-                     f"{format_time(timestamp)}[/color][/size]")
+            self._stamp = (f" [size={int(dp(10))}][color=#9a93a4]"
+                           f"{format_time(timestamp)}[/color][/size]")
 
-        self._label = Label(text=body, markup=True, color=COLOR_TEXT,
+        self._label = Label(text=self._compose(), markup=True, color=COLOR_TEXT,
                              halign="left", size_hint=(None, None))
         self._bubble = BoxLayout(size_hint=(None, None),
                                   padding=(dp(self.PAD_X), dp(self.PAD_Y)))
@@ -1916,6 +2090,18 @@ class ChatBubble(BoxLayout):
             self.add_widget(Widget())
 
         self.bind(width=self._relayout)
+        self._relayout()
+
+    def _compose(self):
+        extra = ticks_markup(self._status) if self._status else ""
+        return self._base + self._stamp + extra
+
+    def set_status(self, status):
+        """Live receipt update: pending -> delivered -> seen ticks."""
+        if not self._mine or status == self._status:
+            return
+        self._status = status
+        self._label.text = self._compose()
         self._relayout()
 
     def _sync(self, *_args):
@@ -1991,6 +2177,7 @@ class ChatScreen(Screen):
     peer_online = BooleanProperty(False)
     peer = None
     _last_day = None
+    _bubbles = None
 
     def set_peer(self, peer):
         self.peer = peer
@@ -1998,8 +2185,10 @@ class ChatScreen(Screen):
         self.peer_online = bool(peer.get("online"))
         self.peer_status = "Online" if self.peer_online else f"Last seen {format_last_seen(peer.get('last_seen'))}"
         self._last_day = None
+        self._bubbles = {}  # msg_id -> ChatBubble (mine only, for receipts)
         self.ids.message_list.clear_widgets()
         self.load_history()
+        App.get_running_app().notify_chat_opened(peer)
 
     def load_history(self):
         app = App.get_running_app()
@@ -2015,7 +2204,8 @@ class ChatScreen(Screen):
         for _ts, kind, item in items:
             if kind == "message":
                 mine = item["direction"] == "out"
-                self.append_message(item["text"], mine=mine, timestamp=item["timestamp"])
+                self.append_message(item["text"], mine=mine, timestamp=item["timestamp"],
+                                    msg_id=item.get("msg_id"), status=item.get("status"))
             elif kind == "call":
                 self.append_event(self._call_log_text(item), timestamp=item["timestamp"])
             elif kind == "file":
@@ -2058,19 +2248,26 @@ class ChatScreen(Screen):
         app = App.get_running_app()
         peer_id = self.peer["id"]
         peer_ip = self.peer["ip"]
-        peer_name = self.peer_name
-
-        def do_send():
-            try:
-                app.message_server.send_message(peer_id, peer_name, peer_ip, text)
-            except OSError:
-                Clock.schedule_once(lambda dt: self._on_send_failed(peer_name), 0)
-
-        threading.Thread(target=do_send, daemon=True).start()
-        self.append_message(text, mine=True)
+        # Queue first (survives app restarts and offline peers), then try
+        # to deliver right away in the background. The bubble starts with
+        # the pending "…" and upgrades to ticks as receipts come back.
+        msg_id = app.message_server.queue_message(peer_id, self.peer_name, text)
+        threading.Thread(target=app.message_server.flush_outbox,
+                          args=(peer_id, peer_ip), daemon=True).start()
+        self.append_message(text, mine=True, msg_id=msg_id, status="pending")
         self.ids.chat_input.text = ""
 
     def on_send_file(self):
+        if platform == "android":
+            # SAF document picker: works on every Android version with no
+            # storage permission at all, unlike plyer's filechooser which
+            # relies on READ_EXTERNAL_STORAGE (dead for general files on
+            # API 33+) and crashes/returns nothing on modern phones.
+            try:
+                android_pick_file(self._start_file_send)
+            except Exception:
+                self.append_event("Couldn't open the file picker")
+            return
         try:
             from plyer import filechooser
         except Exception:
@@ -2087,24 +2284,28 @@ class ChatScreen(Screen):
         app = App.get_running_app()
         peer = self.peer
 
-        if path.startswith("content://"):
-            try:
-                local_dir = os.path.join(app.user_data_dir, "outgoing_tmp")
-                path = resolve_android_content_uri(path, local_dir)
-            except Exception:
-                self.append_event("Couldn't read that file - try picking it again")
-                return
-
-        self.append_event(f"Sending {os.path.basename(path)}…")
-
         def do_send():
-            app.file_manager.send_file(peer["id"], peer["name"], peer["ip"], path)
+            local = path
+            if local.startswith("content://"):
+                # Copying out of the ContentResolver can take a while for
+                # big files - do it here on the worker, never the UI thread.
+                try:
+                    local_dir = os.path.join(app.user_data_dir, "outgoing_tmp")
+                    local = resolve_android_content_uri(local, local_dir)
+                except Exception:
+                    Clock.schedule_once(lambda dt: self.append_event(
+                        "Couldn't read that file - try picking it again"), 0)
+                    return
+            Clock.schedule_once(lambda dt: self.append_event(
+                f"Sending {os.path.basename(local)}…"), 0)
+            app.file_manager.send_file(peer["id"], peer["name"], peer["ip"], local)
 
         threading.Thread(target=do_send, daemon=True).start()
 
-    def _on_send_failed(self, peer_name):
-        if self.peer_name == peer_name:
-            self.append_event("Couldn't deliver - device unreachable")
+    def update_message_status(self, msg_id, status):
+        bubble = self._bubbles.get(msg_id)
+        if bubble:
+            bubble.set_status(status)
 
     def _maybe_date_chip(self, ts):
         day = time.localtime(ts)[:3]
@@ -2112,10 +2313,13 @@ class ChatScreen(Screen):
             self._last_day = day
             self.ids.message_list.add_widget(DateChip(format_date_chip(ts)))
 
-    def append_message(self, text, mine, timestamp=None):
+    def append_message(self, text, mine, timestamp=None, msg_id=None, status=None):
         ts = timestamp or time.time()
         self._maybe_date_chip(ts)
-        self.ids.message_list.add_widget(ChatBubble(text, mine, timestamp=ts))
+        bubble = ChatBubble(text, mine, timestamp=ts, status=status)
+        if mine and msg_id and self._bubbles is not None:
+            self._bubbles[msg_id] = bubble
+        self.ids.message_list.add_widget(bubble)
         Clock.schedule_once(lambda dt: setattr(self.ids.chat_scroll, "scroll_y", 0), 0.05)
 
     def append_event(self, text, on_retry=None, timestamp=None):
@@ -2177,6 +2381,11 @@ class CallScreen(Screen):
     def on_calling(self, peer_name):
         self.peer_name = peer_name
         self.status_text = "Calling..."
+        self.show_accept = False
+
+    def on_ringing(self, peer_name):
+        self.peer_name = peer_name
+        self.status_text = "Ringing..."
         self.show_accept = False
 
     def on_active(self, peer_name):
@@ -2255,6 +2464,10 @@ class LancomApp(App):
             # Not a runtime permission - a separate system settings prompt,
             # so it's requested after the batch above rather than mixed in.
             Clock.schedule_once(lambda dt: android_notify.request_ignore_battery_optimizations(), 1.5)
+            # Without a MulticastLock Android silently drops the UDP
+            # broadcasts discovery depends on; the wifi/wake locks keep
+            # the radio and CPU serviceable while backgrounded.
+            android_notify.acquire_background_locks()
 
         if self.profile_store.exists("profile"):
             name = self.profile_store.get("profile").get("name", "")
@@ -2282,18 +2495,51 @@ class LancomApp(App):
         self.display_name = name
         self.profile_store.put("profile", name=name)
 
-        self.discovery = PeerDiscovery(name, self.store)
-        self.discovery.start()
-
-        self.message_server = MessageServer(name, self.store, self._on_message_received)
-        self.message_server.start()
-
+        # Construct everything before starting anything: discovery's
+        # on_peer_online fires from its listener thread and reaches into
+        # message_server, so all of them must exist first.
+        self.discovery = PeerDiscovery(name, self.store,
+                                        on_peer_online=self._on_peer_online)
+        self.message_server = MessageServer(name, self.store,
+                                             self._on_message_received,
+                                             on_receipt=self._on_receipt)
         self.call_manager = CallManager(name, self.store, self._on_call_event)
-        self.call_manager.start()
-
         files_dir = os.path.join(self.user_data_dir, "received_files")
         self.file_manager = FileTransferManager(name, self.store, files_dir, self._on_file_event)
+
+        self.discovery.start()
+        self.message_server.start()
+        self.call_manager.start()
         self.file_manager.start()
+
+    def _on_peer_online(self, peer_id, ip):
+        # A peer just (re)appeared - push anything queued for it. Runs on
+        # the discovery listener thread; the flush does its own threading
+        # discipline via the per-peer lock.
+        threading.Thread(target=self.message_server.flush_outbox,
+                          args=(peer_id, ip), daemon=True).start()
+
+    def _on_receipt(self, msg_id, status):
+        Clock.schedule_once(lambda dt: self._dispatch_receipt(msg_id, status), 0)
+
+    def _dispatch_receipt(self, msg_id, status):
+        chat = self.root.get_screen("chat")
+        if self.root.current == "chat":
+            chat.update_message_status(msg_id, status)
+
+    def notify_chat_opened(self, peer):
+        """Called when a chat screen opens: read-receipt the backlog and
+        opportunistically flush anything still queued for this peer."""
+        if not self.message_server:
+            return
+        peer_id = peer["id"]
+        ids = self.store.get_unseen_incoming_ids(peer_id)
+        if ids:
+            self.store.mark_seen_receipts_sent(peer_id, ids)
+            self.message_server.send_receipt(peer_id, peer.get("ip"), ids,
+                                             "seen", background=True)
+        threading.Thread(target=self.message_server.flush_outbox,
+                          args=(peer_id, peer.get("ip")), daemon=True).start()
 
     def _on_message_received(self, msg):
         Clock.schedule_once(lambda dt: self._dispatch_message(msg), 0)
@@ -2303,7 +2549,14 @@ class LancomApp(App):
         viewing_this_chat = (self.root.current == "chat" and chat.peer
                               and chat.peer.get("id") == msg.get("from_id"))
         chat.receive_message(msg)
-        if not viewing_this_chat or not self._is_foreground:
+        if viewing_this_chat and self._is_foreground:
+            # The message is on screen right now - tell the sender it's seen.
+            mid = msg.get("msg_id")
+            if mid:
+                self.store.mark_seen_receipts_sent(msg["from_id"], [mid])
+                self.message_server.send_receipt(msg["from_id"], msg.get("ip"),
+                                                 [mid], "seen", background=True)
+        else:
             android_notify.notify_message(msg.get("from_name", "Unknown"), msg.get("text", ""))
 
     def _on_call_event(self, event):
@@ -2318,10 +2571,14 @@ class LancomApp(App):
             self.root.current = "call"
             if not self._is_foreground:
                 android_notify.notify_incoming_call(event["peer_name"])
+        elif kind == "call_ringing":
+            call_screen.on_ringing(event["peer_name"])
         elif kind == "call_active":
             call_screen.on_active(event["peer_name"])
         elif kind == "call_rejected":
-            call_screen.on_ended(f"{event['peer_name']} declined")
+            reason = ("is busy on another call"
+                      if event.get("reason") == "busy" else "declined")
+            call_screen.on_ended(f"{event['peer_name']} {reason}")
         elif kind == "call_failed":
             call_screen.on_ended("Call failed")
         elif kind == "call_ended":
