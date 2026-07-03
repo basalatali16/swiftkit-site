@@ -1,13 +1,16 @@
 [app]
 
-title = LANCOM
+# Display name only. package.name/domain are the app's INSTALL IDENTITY -
+# changing them makes Android treat it as a different app (no updates
+# over existing installs, service class path changes), so they stay.
+title = IP Phone
 package.name = lancomm
 package.domain = com.localnet
 
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 
-version = 0.5
+version = 0.6
 
 # The entire networking stack runs in this sticky foreground service
 # (service.py), so messages/calls/files keep arriving with the app
@@ -41,7 +44,7 @@ android.presplash_color = #060810
 # locks (android_notify.acquire_background_locks) that keep discovery and
 # message delivery working with the screen off. Both are install-time
 # permissions - no user prompt.
-android.permissions = INTERNET,RECORD_AUDIO,ACCESS_WIFI_STATE,ACCESS_NETWORK_STATE,MODIFY_AUDIO_SETTINGS,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,POST_NOTIFICATIONS,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,WAKE_LOCK,WAKE_LOCK,CHANGE_WIFI_MULTICAST_STATE
+android.permissions = INTERNET,RECORD_AUDIO,ACCESS_WIFI_STATE,ACCESS_NETWORK_STATE,MODIFY_AUDIO_SETTINGS,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,POST_NOTIFICATIONS,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,WAKE_LOCK,USE_FULL_SCREEN_INTENT,VIBRATE,WAKE_LOCK,CHANGE_WIFI_MULTICAST_STATE
 
 android.api = 34
 android.minapi = 24

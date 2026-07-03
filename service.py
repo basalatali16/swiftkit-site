@@ -32,8 +32,11 @@ if IS_ANDROID:
 DATA_DIR = app_data_dir()
 
 core = NetworkCore(DATA_DIR)
-policy = EventPolicy(core, android_notify.notify_message,
-                     android_notify.notify_incoming_call)
+policy = EventPolicy(
+    core, android_notify.notify_message,
+    lambda peer, fg: android_notify.start_ringing(peer,
+                                                  show_notification=not fg),
+    stop_call_alert=android_notify.stop_ringing)
 server = None  # set below; on_event guards against early events
 
 
@@ -90,12 +93,15 @@ def handle_command(cmd):
         ok = core.call(cmd["peer_id"], cmd["peer_ip"], cmd["peer_name"])
         return {"ok": bool(ok)}
     if op == "accept":
+        android_notify.stop_ringing()
         core.accept_call()
         return {"ok": True}
     if op == "reject":
+        android_notify.stop_ringing()
         core.reject_call()
         return {"ok": True}
     if op == "hang_up":
+        android_notify.stop_ringing()
         core.hang_up()
         return {"ok": True}
     if op == "call_state":

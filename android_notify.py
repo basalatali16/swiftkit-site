@@ -14,10 +14,17 @@ IS_ANDROID = "ANDROID_ARGUMENT" in os.environ
 
 CHANNEL_MESSAGES = "lancom_messages"
 CHANNEL_CALLS = "lancom_calls"
+CHANNEL_RING = "lancom_ring"  # silent channel: we loop the ringtone ourselves
+
+CALL_NOTIF_ID = 2
 
 # Locks held for the process's lifetime (never released on purpose) -
 # kept here so the GC can't collect them, which would release them.
 _held_locks = []
+
+# The looping Ringtone for the currently ringing incoming call.
+_ringtone = None
+_ring_lock = None
 
 
 def _context():
@@ -140,7 +147,102 @@ def notify_message(peer_name, text):
 
 
 def notify_incoming_call(peer_name):
-    _notify(CHANNEL_CALLS, "Calls", "Incoming call", peer_name, notif_id=2, ringtone=True)
+    _notify(CHANNEL_CALLS, "Calls", "Incoming call", peer_name,
+            notif_id=CALL_NOTIF_ID, ringtone=True)
+
+
+def start_ringing(peer_name, show_notification=True):
+    """Ring like a phone: loop the device ringtone until stop_ringing().
+    With show_notification (app not visible) also post a full-screen
+    CATEGORY_CALL notification - on a locked phone that lights the screen
+    with the incoming-call alert, and tapping it opens the app straight
+    into the call screen (the UI re-syncs call state on connect)."""
+    if not IS_ANDROID:
+        return
+    global _ringtone
+    stop_ringing()
+    try:
+        from jnius import autoclass
+        RingtoneManager = autoclass("android.media.RingtoneManager")
+        Build_VERSION = autoclass("android.os.Build$VERSION")
+        ctx = _context()
+        uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+        ringtone = RingtoneManager.getRingtone(ctx, uri)
+        if ringtone is not None:
+            if Build_VERSION.SDK_INT >= 28:
+                ringtone.setLooping(True)
+            ringtone.play()
+            _ringtone = ringtone
+    except Exception:
+        pass
+
+    if not show_notification:
+        return
+    try:
+        from jnius import autoclass
+        ctx, manager = _get_notification_manager()
+
+        # Channel with NO sound of its own (we loop the ringtone above) -
+        # a channel sound would play once, overlapping ours.
+        Build_VERSION = autoclass("android.os.Build$VERSION")
+        if Build_VERSION.SDK_INT >= 26:
+            NotificationChannel = autoclass("android.app.NotificationChannel")
+            NotificationManager = autoclass("android.app.NotificationManager")
+            String = autoclass("java.lang.String")
+            channel = NotificationChannel(String(CHANNEL_RING),
+                                          String("Incoming calls"),
+                                          NotificationManager.IMPORTANCE_HIGH)
+            channel.setSound(None, None)
+            channel.enableVibration(True)
+            manager.createNotificationChannel(channel)
+
+        NotificationBuilder = autoclass("android.app.Notification$Builder")
+        Notification = autoclass("android.app.Notification")
+        PendingIntent = autoclass("android.app.PendingIntent")
+        String = autoclass("java.lang.String")
+
+        builder = (NotificationBuilder(ctx, String(CHANNEL_RING))
+                   if Build_VERSION.SDK_INT >= 26 else NotificationBuilder(ctx))
+        builder.setContentTitle(String("Incoming call"))
+        builder.setContentText(String(peer_name))
+        builder.setSmallIcon(ctx.getApplicationInfo().icon)
+        builder.setOngoing(True)
+        builder.setCategory(Notification.CATEGORY_CALL)
+        builder.setPriority(2)
+
+        launch = ctx.getPackageManager().getLaunchIntentForPackage(
+            ctx.getPackageName())
+        if launch is not None:
+            pending = PendingIntent.getActivity(
+                ctx, 0, launch,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
+            builder.setContentIntent(pending)
+            # Full-screen intent = wake the screen and show the call UI,
+            # the way real dialers do. Needs USE_FULL_SCREEN_INTENT.
+            builder.setFullScreenIntent(pending, True)
+
+        manager.notify(CALL_NOTIF_ID, builder.build())
+    except Exception:
+        pass
+
+
+def stop_ringing():
+    """Silence the ringtone and drop the incoming-call notification."""
+    if not IS_ANDROID:
+        return
+    global _ringtone
+    ringtone = _ringtone
+    _ringtone = None
+    if ringtone is not None:
+        try:
+            ringtone.stop()
+        except Exception:
+            pass
+    try:
+        _ctx, manager = _get_notification_manager()
+        manager.cancel(CALL_NOTIF_ID)
+    except Exception:
+        pass
 
 
 def request_ignore_battery_optimizations():

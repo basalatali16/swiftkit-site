@@ -45,18 +45,22 @@ from lancom_ipc import ControlClient, control_token
 from netcore import IMAGE_EXTS, EventPolicy, NetworkCore
 from store import Store
 
-# "Luxury" palette - deep navy background, warm gold accent.
-COLOR_BG = (0.035, 0.043, 0.078, 1)
-COLOR_CARD = (0.075, 0.086, 0.13, 1)
-COLOR_GOLD = (0.83, 0.69, 0.42, 1)
+# "Colorful luxury" palette - deep indigo night, royal violet primary,
+# aqua-teal presence accent, coral danger, lavender text accents.
+COLOR_BG = (0.05, 0.045, 0.11, 1)
+COLOR_CARD = (0.115, 0.10, 0.21, 1)
+COLOR_PRIMARY = (0.48, 0.38, 0.95, 1)
+COLOR_PRIMARY_DOWN = (0.36, 0.28, 0.75, 1)
+COLOR_LAVENDER = (0.78, 0.74, 1.0, 1)
+COLOR_GOLD = (0.95, 0.72, 0.35, 1)
 COLOR_GOLD_DIM = (0.6, 0.5, 0.32, 1)
-COLOR_TEXT = (0.94, 0.93, 0.90, 1)
-COLOR_TEXT_DIM = (0.58, 0.58, 0.64, 1)
-COLOR_ONLINE = (0.36, 0.82, 0.55, 1)
-COLOR_OFFLINE = (0.46, 0.46, 0.52, 1)
-COLOR_DANGER = (0.80, 0.28, 0.28, 1)
-COLOR_BUBBLE_MINE = (0.27, 0.22, 0.12, 1)  # own messages - warm gold-dark
-COLOR_CHIP = (0.10, 0.115, 0.17, 1)  # date separator chips
+COLOR_TEXT = (0.96, 0.95, 1.0, 1)
+COLOR_TEXT_DIM = (0.62, 0.60, 0.72, 1)
+COLOR_ONLINE = (0.25, 0.88, 0.76, 1)
+COLOR_OFFLINE = (0.47, 0.45, 0.58, 1)
+COLOR_DANGER = (0.96, 0.34, 0.42, 1)
+COLOR_BUBBLE_MINE = (0.33, 0.25, 0.57, 1)  # own messages - deep violet
+COLOR_CHIP = (0.13, 0.115, 0.24, 1)  # date separator chips
 
 # Kivy's default Roboto has no check-mark glyph (U+2713 renders as a
 # hollow box), but Kivy also bundles DejaVuSans which does - the message
@@ -74,9 +78,9 @@ def ticks_markup(status):
     """WhatsApp-style status suffix for an outgoing bubble: '…' queued,
     dim double-check delivered, gold double-check seen."""
     if status == "pending":
-        return " [color=#8d8d99]…[/color]"
+        return " [color=#8f8ba6]…[/color]"
     if status in ("delivered", "seen"):
-        color = "#d8b26c" if status == "seen" else "#8d8d99"
+        color = "#4de3c9" if status == "seen" else "#8f8ba6"
         if TICK_FONT:
             return f" [color={color}][font={TICK_FONT}]✓✓[/font][/color]"
         return f" [color={color}]✓✓[/color]"
@@ -84,8 +88,8 @@ def ticks_markup(status):
 
 
 AVATAR_COLORS = [
-    (0.72, 0.45, 0.20), (0.30, 0.48, 0.75), (0.52, 0.36, 0.75),
-    (0.75, 0.32, 0.48), (0.30, 0.62, 0.48), (0.83, 0.69, 0.42),
+    (0.95, 0.45, 0.42), (0.35, 0.55, 0.95), (0.62, 0.42, 0.95),
+    (0.92, 0.40, 0.65), (0.25, 0.75, 0.62), (0.95, 0.70, 0.35),
 ]
 
 
@@ -227,8 +231,11 @@ class DirectBackend:
         self._ui_event = on_event
         self.core = NetworkCore(data_dir, on_event=self._handle)
         self.identity = self.core.identity
-        self.policy = EventPolicy(self.core, android_notify.notify_message,
-                                  android_notify.notify_incoming_call)
+        self.policy = EventPolicy(
+            self.core, android_notify.notify_message,
+            lambda peer, fg: android_notify.start_ringing(
+                peer, show_notification=not fg),
+            stop_call_alert=android_notify.stop_ringing)
 
     def _handle(self, ev):
         try:
@@ -304,8 +311,8 @@ class ServiceBackend:
             from jnius import autoclass
             activity = autoclass("org.kivy.android.PythonActivity").mActivity
             service = autoclass("com.localnet.lancomm.ServiceLancomnet")
-            service.start(activity, "", "LANCOM",
-                          "Connected - receiving messages and calls", "")
+            service.start(activity, "", "IP Phone",
+                          "Connected - receiving calls and messages", "")
         except Exception:
             pass
 
@@ -387,11 +394,11 @@ ScreenManager:
     background_normal: ""
     background_down: ""
     background_color: 0, 0, 0, 0
-    color: 0.05, 0.06, 0.1, 1
+    color: 1, 1, 1, 1
     bold: True
     canvas.before:
         Color:
-            rgba: (0.64, 0.52, 0.30, 1) if self.state == "down" else (0.83, 0.69, 0.42, 1)
+            rgba: (0.36, 0.28, 0.75, 1) if self.state == "down" else (0.48, 0.38, 0.95, 1)
         RoundedRectangle:
             pos: self.pos
             size: self.size
@@ -401,11 +408,11 @@ ScreenManager:
     background_normal: ""
     background_down: ""
     background_color: 0, 0, 0, 0
-    color: 0.83, 0.69, 0.42, 1
+    color: 0.78, 0.74, 1, 1
     bold: True
     canvas.before:
         Color:
-            rgba: (0.18, 0.21, 0.30, 1) if self.state == "down" else (0.12, 0.14, 0.21, 1)
+            rgba: (0.20, 0.17, 0.34, 1) if self.state == "down" else (0.135, 0.12, 0.24, 1)
         RoundedRectangle:
             pos: self.pos
             size: self.size
@@ -419,7 +426,7 @@ ScreenManager:
     bold: True
     canvas.before:
         Color:
-            rgba: (0.60, 0.20, 0.20, 1) if self.state == "down" else (0.80, 0.28, 0.28, 1)
+            rgba: (0.74, 0.24, 0.32, 1) if self.state == "down" else (0.96, 0.34, 0.42, 1)
         RoundedRectangle:
             pos: self.pos
             size: self.size
@@ -429,11 +436,11 @@ ScreenManager:
     background_normal: ""
     background_down: ""
     background_color: 0, 0, 0, 0
-    color: 0.83, 0.69, 0.42, 1
+    color: 0.78, 0.74, 1, 1
     bold: True
     canvas.before:
         Color:
-            rgba: (0.18, 0.21, 0.30, 1) if self.state == "down" else (0.12, 0.14, 0.21, 1)
+            rgba: (0.20, 0.17, 0.34, 1) if self.state == "down" else (0.135, 0.12, 0.24, 1)
         RoundedRectangle:
             pos: self.pos
             size: self.size
@@ -443,11 +450,11 @@ ScreenManager:
     background_normal: ""
     background_down: ""
     background_color: 0, 0, 0, 0
-    color: 0.05, 0.06, 0.1, 1
+    color: 1, 1, 1, 1
     bold: True
     canvas.before:
         Color:
-            rgba: (0.64, 0.52, 0.30, 1) if self.state == "down" else (0.83, 0.69, 0.42, 1)
+            rgba: (0.36, 0.28, 0.75, 1) if self.state == "down" else (0.48, 0.38, 0.95, 1)
         RoundedRectangle:
             pos: self.pos
             size: self.size
@@ -461,7 +468,7 @@ ScreenManager:
         spacing: dp(16)
         canvas.before:
             Color:
-                rgba: 0.035, 0.043, 0.078, 1
+                rgba: 0.05, 0.045, 0.11, 1
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -470,15 +477,15 @@ ScreenManager:
             size_hint_y: 0.3
 
         Label:
-            text: "LANCOM"
+            text: "IP Phone"
             font_size: dp(40)
             bold: True
-            color: 0.83, 0.69, 0.42, 1
+            color: 0.72, 0.62, 1, 1
             size_hint_y: None
             height: dp(52)
 
         Label:
-            text: "LAN voice + messaging, no internet needed"
+            text: "Calls, chat & files over WiFi - no internet needed"
             color: 0.58, 0.58, 0.64, 1
             size_hint_y: None
             height: dp(24)
@@ -493,10 +500,10 @@ ScreenManager:
             size_hint_y: None
             height: dp(48)
             padding: dp(12), dp(12)
-            background_color: 0.075, 0.086, 0.13, 1
-            foreground_color: 0.94, 0.93, 0.90, 1
-            hint_text_color: 0.5, 0.5, 0.55, 1
-            cursor_color: 0.83, 0.69, 0.42, 1
+            background_color: 0.115, 0.10, 0.21, 1
+            foreground_color: 0.96, 0.95, 1, 1
+            hint_text_color: 0.55, 0.52, 0.66, 1
+            cursor_color: 0.72, 0.62, 1, 1
 
         Label:
             id: setup_error
@@ -519,7 +526,7 @@ ScreenManager:
         orientation: "vertical"
         canvas.before:
             Color:
-                rgba: 0.035, 0.043, 0.078, 1
+                rgba: 0.05, 0.045, 0.11, 1
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -530,10 +537,10 @@ ScreenManager:
             padding: dp(16), dp(8)
             spacing: dp(8)
             Label:
-                text: "LANCOM"
+                text: "IP Phone"
                 bold: True
                 font_size: dp(20)
-                color: 0.83, 0.69, 0.42, 1
+                color: 0.72, 0.62, 1, 1
                 halign: "left"
                 valign: "middle"
                 text_size: self.size
@@ -549,7 +556,7 @@ ScreenManager:
             id: debug_info
             text: ""
             font_size: dp(10)
-            color: 0.4, 0.4, 0.46, 1
+            color: 0.45, 0.43, 0.56, 1
             size_hint_y: None
             height: dp(16)
 
@@ -568,7 +575,7 @@ ScreenManager:
         orientation: "vertical"
         canvas.before:
             Color:
-                rgba: 0.035, 0.043, 0.078, 1
+                rgba: 0.05, 0.045, 0.11, 1
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -580,7 +587,7 @@ ScreenManager:
             spacing: dp(8)
             canvas.before:
                 Color:
-                    rgba: 0.075, 0.086, 0.13, 1
+                    rgba: 0.115, 0.10, 0.21, 1
                 Rectangle:
                     pos: self.pos
                     size: self.size
@@ -596,14 +603,14 @@ ScreenManager:
                     text: root.peer_name
                     bold: True
                     font_size: dp(16)
-                    color: 0.94, 0.93, 0.90, 1
+                    color: 0.96, 0.95, 1, 1
                     halign: "left"
                     text_size: self.size
                     valign: "bottom"
                 Label:
                     text: root.peer_status
                     font_size: dp(10)
-                    color: (0.36, 0.82, 0.55, 1) if root.peer_online else (0.46, 0.46, 0.52, 1)
+                    color: (0.25, 0.88, 0.76, 1) if root.peer_online else (0.47, 0.45, 0.58, 1)
                     halign: "left"
                     text_size: self.size
                     valign: "top"
@@ -645,7 +652,7 @@ ScreenManager:
                 padding: dp(14), dp(4)
                 canvas.before:
                     Color:
-                        rgba: 0.075, 0.086, 0.13, 1
+                        rgba: 0.115, 0.10, 0.21, 1
                     RoundedRectangle:
                         pos: self.pos
                         size: self.size
@@ -657,9 +664,9 @@ ScreenManager:
                     background_normal: ""
                     background_active: ""
                     background_color: 0, 0, 0, 0
-                    foreground_color: 0.94, 0.93, 0.90, 1
-                    hint_text_color: 0.5, 0.5, 0.55, 1
-                    cursor_color: 0.83, 0.69, 0.42, 1
+                    foreground_color: 0.96, 0.95, 1, 1
+                    hint_text_color: 0.55, 0.52, 0.66, 1
+                    cursor_color: 0.72, 0.62, 1, 1
                     padding: dp(4), max(0, (self.height - self.line_height) / 2)
                     on_text_validate: root.on_send(chat_input.text)
             PillLuxButton:
@@ -676,7 +683,7 @@ ScreenManager:
         spacing: dp(16)
         canvas.before:
             Color:
-                rgba: 0.035, 0.043, 0.078, 1
+                rgba: 0.05, 0.045, 0.11, 1
             Rectangle:
                 pos: self.pos
                 size: self.size
@@ -688,13 +695,13 @@ ScreenManager:
             text: root.peer_name
             font_size: dp(28)
             bold: True
-            color: 0.94, 0.93, 0.90, 1
+            color: 0.96, 0.95, 1, 1
             size_hint_y: None
             height: dp(40)
 
         Label:
             text: root.status_text
-            color: 0.83, 0.69, 0.42, 1
+            color: 0.72, 0.62, 1, 1
             size_hint_y: None
             height: dp(28)
 
@@ -806,11 +813,11 @@ class ContactRow(BoxLayout):
         # ellipsis instead of letter-wrapping when a name outgrows the
         # space between the avatar and the buttons.
         name_label = Label(text=escape_markup(peer["name"]), bold=True, font_size=dp(15),
-                            color=(0.94, 0.93, 0.90, 1), halign="left", valign="bottom",
+                            color=(0.96, 0.95, 1, 1), halign="left", valign="bottom",
                             shorten=True, shorten_from="right", size_hint_y=0.55)
         name_label.bind(size=lambda inst, val: setattr(inst, "text_size", val))
         status_text = "Online" if online else f"Last seen {format_last_seen(peer.get('last_seen'))}"
-        status_color = (0.36, 0.82, 0.55, 1) if online else (0.46, 0.46, 0.52, 1)
+        status_color = (0.25, 0.88, 0.76, 1) if online else (0.47, 0.45, 0.58, 1)
         status_label = Label(text=status_text, font_size=dp(12), color=status_color,
                               halign="left", valign="top", shorten=True,
                               shorten_from="right", size_hint_y=0.45)
@@ -819,18 +826,18 @@ class ContactRow(BoxLayout):
         info.add_widget(status_label)
         self.add_widget(info)
 
-        chat_btn = RoundButton(bg=(0.12, 0.14, 0.21, 1), text="Chat",
+        chat_btn = RoundButton(bg=(0.135, 0.12, 0.24, 1), text="Chat",
                                 size_hint=(None, None), size=(dp(56), dp(38)),
                                 pos_hint={"center_y": 0.5}, font_size=dp(13),
-                                color=(0.83, 0.69, 0.42, 1), bold=True)
+                                color=(0.78, 0.74, 1, 1), bold=True)
         chat_btn.bind(on_release=lambda *_: on_open_chat(peer))
         self.add_widget(chat_btn)
 
-        call_btn = RoundButton(bg=(0.83, 0.69, 0.42, 1), text="Call",
+        call_btn = RoundButton(bg=(0.48, 0.38, 0.95, 1), text="Call",
                                 size_hint=(None, None), size=(dp(56), dp(38)),
                                 pos_hint={"center_y": 0.5}, disabled=not online,
                                 opacity=1 if online else 0.35, font_size=dp(13),
-                                color=(0.05, 0.06, 0.1, 1), bold=True)
+                                color=(1, 1, 1, 1), bold=True)
         call_btn.bind(on_release=lambda *_: on_call(peer))
         self.add_widget(call_btn)
 
@@ -865,7 +872,7 @@ class UsersScreen(Screen):
         if not peers:
             container.add_widget(Label(text="Searching for devices on this WiFi...",
                                         size_hint_y=None, height=40,
-                                        color=(0.5, 0.5, 0.55, 1)))
+                                        color=(0.55, 0.52, 0.66, 1)))
         for peer in peers:
             container.add_widget(ContactRow(peer, self.open_chat, self.call_peer))
 
@@ -888,13 +895,13 @@ class UsersScreen(Screen):
             hint_text="e.g. 192.168.1.23", multiline=False,
             size_hint_y=None, height=dp(44), padding=(dp(12), dp(12)),
             background_color=COLOR_CARD, foreground_color=COLOR_TEXT,
-            hint_text_color=(0.5, 0.5, 0.55, 1), cursor_color=COLOR_GOLD,
+            hint_text_color=(0.55, 0.52, 0.66, 1), cursor_color=COLOR_LAVENDER,
             input_filter=lambda s, _undo: "".join(c for c in s if c in "0123456789."),
         )
         error = Label(text="", font_size=dp(12), color=COLOR_DANGER,
                        size_hint_y=None, height=dp(18))
-        add_btn = RoundButton(bg=COLOR_GOLD, text="Add device", bold=True,
-                               color=(0.05, 0.06, 0.1, 1),
+        add_btn = RoundButton(bg=COLOR_PRIMARY, text="Add device", bold=True,
+                               color=(1, 1, 1, 1),
                                size_hint_y=None, height=dp(44))
         content.add_widget(hint)
         content.add_widget(ip_input)
@@ -949,7 +956,7 @@ class ChatBubble(BoxLayout):
         self._base = escape_markup(text)
         self._stamp = ""
         if timestamp:
-            self._stamp = (f" [size={int(dp(10))}][color=#9a93a4]"
+            self._stamp = (f" [size={int(dp(10))}][color=#948fb0]"
                            f"{format_time(timestamp)}[/color][/size]")
 
         self._label = Label(text=self._compose(), markup=True, color=COLOR_TEXT,
@@ -1067,7 +1074,7 @@ class DateChip(BoxLayout):
         super().__init__(orientation="horizontal", size_hint_y=None,
                           height=dp(32), padding=(0, dp(5)), **kwargs)
         self._label = Label(text=text, font_size=dp(11), bold=True,
-                             color=(0.62, 0.62, 0.68, 1), size_hint=(None, None))
+                             color=(0.66, 0.63, 0.78, 1), size_hint=(None, None))
         self._label.bind(texture_size=lambda inst, val: setattr(
             inst, "size", (val[0] + dp(20), dp(22))))
         with self._label.canvas.before:
@@ -1092,15 +1099,15 @@ class ChatEvent(BoxLayout):
     def __init__(self, text, on_retry=None, **kwargs):
         super().__init__(orientation="vertical", size_hint_y=None, spacing=dp(4), **kwargs)
         label = Label(text=escape_markup(text), font_size=dp(12),
-                      color=(0.55, 0.55, 0.6, 1), size_hint_y=None, halign="center")
+                      color=(0.58, 0.56, 0.68, 1), size_hint_y=None, halign="center")
         label.bind(texture_size=lambda inst, val: setattr(label, "height", val[1] + 6))
         label.bind(width=lambda inst, val: setattr(label, "text_size", (val, None)))
         self.add_widget(label)
         if on_retry:
-            retry_btn = RoundButton(bg=(0.83, 0.69, 0.42, 1), text="Retry",
+            retry_btn = RoundButton(bg=(0.48, 0.38, 0.95, 1), text="Retry",
                                      size_hint=(None, None), size=(dp(72), dp(28)),
                                      pos_hint={"center_x": 0.5}, radius=[dp(14)],
-                                     color=(0.05, 0.06, 0.1, 1), font_size=dp(11), bold=True)
+                                     color=(1, 1, 1, 1), font_size=dp(11), bold=True)
             retry_btn.bind(on_release=lambda *_: on_retry())
             self.add_widget(retry_btn)
         self.bind(minimum_height=self.setter("height"))
@@ -1505,6 +1512,10 @@ class LancomApp(App):
             call_screen.on_ended("Call failed")
         elif kind == "call_ended":
             call_screen.on_ended("Call ended")
+        elif kind == "call_missed":
+            call_screen.on_ended("Missed call")
+        elif kind == "call_no_answer":
+            call_screen.on_ended("No answer")
 
     def start_call(self, peer_id, ip, name):
         if self.backend and self.backend.call(peer_id, ip, name):

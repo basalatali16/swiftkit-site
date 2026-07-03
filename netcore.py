@@ -800,7 +800,14 @@ class MessageServer:
 # ---------------------------------------------------------------------------
 
 class CallManager:
-    """Handles call signaling (TCP) and audio streaming (UDP)."""
+    """Handles call signaling (TCP) and audio streaming (UDP).
+
+    Ring timeouts, WhatsApp-style: an unanswered incoming call becomes
+    "missed" after RING_TIMEOUT (event call_missed); an unanswered
+    outgoing call gives up shortly after (event call_no_answer) and
+    tells the peer to stop ringing."""
+
+    RING_TIMEOUT = 45.0
 
     def __init__(self, display_name, store, on_event):
         self.display_name = display_name
@@ -901,6 +908,8 @@ class CallManager:
                         self._reset_to_idle()
                     return
                 self.on_event({"event": "incoming_call", "peer_name": self.peer_name, "peer_ip": self.peer_ip})
+                threading.Thread(target=self._incoming_ring_watch,
+                                  args=(sender_id,), daemon=True).start()
                 return
 
             # ACCEPT/REJECT/HANGUP only apply to messages from the peer we're
@@ -980,9 +989,49 @@ class CallManager:
                 ringing = self.state == "calling" and self.peer_ip == peer_ip
             if ringing:
                 self.on_event({"event": "call_ringing", "peer_name": peer_name})
+                self._outgoing_ring_watch(peer_id, peer_ip, peer_name,
+                                          base64.b64decode(pubkey_b64))
 
         threading.Thread(target=send_invite, daemon=True).start()
         return True
+
+    def _incoming_ring_watch(self, peer_id):
+        """Unanswered incoming call -> missed after RING_TIMEOUT."""
+        deadline = time.time() + self.RING_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(0.5)
+            with self._lock:
+                if not (self.state == "ringing" and self.peer_id == peer_id):
+                    return
+        with self._lock:
+            if not (self.state == "ringing" and self.peer_id == peer_id):
+                return
+            peer_name = self.peer_name
+            self._log_call(peer_id, peer_name, "in", "missed")
+            self._reset_to_idle()
+        self.on_event({"event": "call_missed", "peer_name": peer_name})
+
+    def _outgoing_ring_watch(self, peer_id, peer_ip, peer_name, peer_pubkey):
+        """Unanswered outgoing call -> give up a little after the callee's
+        own missed-call timeout, and tell it to stop ringing. Runs on the
+        send_invite thread (which has nothing left to do)."""
+        deadline = time.time() + self.RING_TIMEOUT + 5.0
+        while time.time() < deadline:
+            time.sleep(0.5)
+            with self._lock:
+                if not (self.state == "calling" and self.peer_id == peer_id):
+                    return
+        with self._lock:
+            if not (self.state == "calling" and self.peer_id == peer_id):
+                return
+            self._log_call(peer_id, peer_name, "out", "cancelled")
+            self._reset_to_idle()
+        try:
+            send_encrypted_tcp(peer_ip, CALL_SIGNAL_PORT, {"type": "HANGUP"},
+                                peer_pubkey)
+        except OSError:
+            pass
+        self.on_event({"event": "call_no_answer", "peer_name": peer_name})
 
     def accept(self):
         with self._lock:
@@ -1549,12 +1598,22 @@ class EventPolicy:
     Android service and the desktop in-process backend. The UI keeps it
     updated about visibility (foreground + which chat is open); events
     for anything the user isn't looking at become notifications, and
-    messages they ARE looking at get auto 'seen' receipts."""
+    messages they ARE looking at get auto 'seen' receipts.
 
-    def __init__(self, core, notify_message, notify_call):
+    Calls RING like a phone: notify_call(peer_name, is_foreground) must
+    start a looping ringtone (plus a full-screen call notification when
+    backgrounded); stop_call_alert() silences it. Both are no-ops off
+    Android."""
+
+    CALL_END_EVENTS = ("call_active", "call_ended", "call_rejected",
+                       "call_failed", "call_missed")
+
+    def __init__(self, core, notify_message, notify_call,
+                 stop_call_alert=None):
         self.core = core
         self.notify_message = notify_message
         self.notify_call = notify_call
+        self.stop_call_alert = stop_call_alert or (lambda: None)
         self.foreground = False
         self.viewing = None  # peer_id whose chat is on screen
 
@@ -1575,8 +1634,15 @@ class EventPolicy:
                                     m.get("text", ""))
         elif kind == "call":
             e = ev.get("event", {})
-            if e.get("event") == "incoming_call" and not self.foreground:
-                self.notify_call(e.get("peer_name", "Unknown"))
+            ce = e.get("event")
+            if ce == "incoming_call":
+                self.notify_call(e.get("peer_name", "Unknown"),
+                                 self.foreground)
+            elif ce in self.CALL_END_EVENTS:
+                self.stop_call_alert()
+                if ce == "call_missed":
+                    self.notify_message(e.get("peer_name", "Unknown"),
+                                        "Missed call")
         elif kind == "file":
             e = ev.get("event", {})
             if (not self.foreground and e.get("event") == "file_received"
