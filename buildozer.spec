@@ -7,7 +7,7 @@ package.domain = com.localnet
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 
-version = 0.3
+version = 0.4
 
 # Kivy 2.3.1 added support for newer CPython (3.13+), which matches the
 # Python version python-for-android currently bundles by default. Pinning

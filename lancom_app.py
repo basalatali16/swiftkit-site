@@ -35,6 +35,7 @@ from kivy.resources import resource_find
 from kivy.storage.jsonstore import JsonStore
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
+from kivy.uix.image import Image as KivyImage
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.screenmanager import Screen, SlideTransition
@@ -56,6 +57,11 @@ BROADCAST_INTERVAL = 2.0
 PEER_TIMEOUT = 7.0
 FILE_CHUNK = 65536
 FILE_TAG_LEN = 16  # ChaCha20-Poly1305 auth tag length appended to each chunk
+
+# Files with these extensions get an inline picture preview in the chat
+# (and keep a private copy for it); everything else is handed straight
+# to the public Downloads folder.
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
 
 # Set once by LancomApp.build() before any networking starts. Every
 # device's id is derived from this identity's public key (see
@@ -213,6 +219,62 @@ def resolve_android_content_uri(uri_str, dest_dir):
         input_stream.close()
 
     return dest_path
+
+
+def export_to_downloads(src_path, filename):
+    """Copy a received file into the phone's public Downloads/LANCOM so
+    the user can actually reach it (Files app, Gallery) - the app's
+    private dir where transfers land is invisible to them. Returns the
+    human-readable destination, or "" if unavailable/failed.
+
+    API 29+ goes through MediaStore (no permission needed for files the
+    app creates); older Androids write directly to the public directory
+    using the WRITE_EXTERNAL_STORAGE permission the app already holds."""
+    if platform != "android":
+        return ""
+    try:
+        from jnius import autoclass
+        Build_VERSION = autoclass("android.os.Build$VERSION")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+
+        if Build_VERSION.SDK_INT >= 29:
+            ContentValues = autoclass("android.content.ContentValues")
+            Downloads = autoclass("android.provider.MediaStore$Downloads")
+            String = autoclass("java.lang.String")
+            resolver = activity.getContentResolver()
+            values = ContentValues()
+            values.put(String("_display_name"), String(filename))
+            values.put(String("relative_path"), String("Download/LANCOM"))
+            uri = resolver.insert(Downloads.EXTERNAL_CONTENT_URI, values)
+            if uri is None:
+                return ""
+            out = resolver.openOutputStream(uri)
+            try:
+                with open(src_path, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+            finally:
+                out.close()
+        else:
+            Environment = autoclass("android.os.Environment")
+            base = Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
+            dest_dir = os.path.join(base, "LANCOM")
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, filename)
+            with open(src_path, "rb") as fin, open(dest, "wb") as fout:
+                while True:
+                    chunk = fin.read(65536)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+        return "Download/LANCOM"
+    except Exception:
+        return ""
 
 
 def android_pick_file(callback):
@@ -1406,16 +1468,30 @@ class FileTransferManager:
             self._finish_incoming(transfer_id, peer_id, peer_name, filename, size, dest_path, status)
 
     def _finish_incoming(self, transfer_id, peer_id, peer_name, filename, size, dest_path, status):
+        final_path = ""
+        saved_to = ""
         if status == "completed":
             final_path = dest_path[:-len(".partial")] if dest_path.endswith(".partial") else dest_path
             try:
                 os.replace(dest_path, final_path)
             except OSError:
                 final_path = dest_path
+            # Hand the file to the user: private app storage is invisible
+            # to them. Images keep the private copy too (the chat renders
+            # an inline preview from it); other files - potentially
+            # GB-scale - are moved rather than duplicated.
+            saved_to = export_to_downloads(final_path, filename)
+            if saved_to and not filename.lower().endswith(IMAGE_EXTS):
+                try:
+                    os.remove(final_path)
+                except OSError:
+                    pass
+                final_path = ""
             self.store.finish_transfer(transfer_id, "completed")
             self.store.add_file_record(peer_id, peer_name, "in", filename, size, final_path, "completed")
         self.on_event({"event": "file_received", "peer_id": peer_id, "peer_name": peer_name,
-                        "filename": filename, "size": size, "status": status})
+                        "filename": filename, "size": size, "status": status,
+                        "path": final_path, "saved_to": saved_to})
 
     def send_file(self, peer_id, peer_name, peer_ip, file_path):
         """Blocking - call from a background thread. Safe to call again
@@ -2124,6 +2200,56 @@ class ChatBubble(BoxLayout):
         self.height = self._bubble.height + dp(2)
 
 
+class ChatImageBubble(BoxLayout):
+    """Inline picture preview for image files in the chat - a rounded
+    frame around the image, right-aligned for sent, left for received."""
+
+    MAX_FRAC = 0.65
+    MAX_H = 280
+
+    def __init__(self, path, mine, **kwargs):
+        super().__init__(orientation="horizontal", size_hint_y=None,
+                          padding=(dp(2), dp(2)), **kwargs)
+        self._img = KivyImage(source=path, size_hint=(None, None),
+                               allow_stretch=True, keep_ratio=True)
+        self._frame = BoxLayout(size_hint=(None, None), padding=(dp(4), dp(4)))
+        with self._frame.canvas.before:
+            Color(*(COLOR_BUBBLE_MINE if mine else COLOR_CARD))
+            self._rect = RoundedRectangle(pos=self._frame.pos,
+                                           size=self._frame.size, radius=[dp(12)])
+        self._frame.bind(pos=self._sync, size=self._sync)
+        self._frame.add_widget(self._img)
+
+        if mine:
+            self.add_widget(Widget())
+            self.add_widget(self._frame)
+        else:
+            self.add_widget(self._frame)
+            self.add_widget(Widget())
+
+        self._img.bind(texture=self._fit)
+        self.bind(width=self._fit)
+        self._fit()
+
+    def _sync(self, *_args):
+        self._rect.pos = self._frame.pos
+        self._rect.size = self._frame.size
+
+    def _fit(self, *_args):
+        tex = self._img.texture
+        if tex is None or not tex.width or not tex.height:
+            # Texture not loaded (yet) - keep a placeholder footprint.
+            self._frame.size = (dp(120), dp(90))
+            self.height = self._frame.height + dp(4)
+            return
+        max_w = max(min(self.width * self.MAX_FRAC, dp(260)), dp(80))
+        scale = min(max_w / tex.width, dp(self.MAX_H) / tex.height)
+        w, h = tex.width * scale, tex.height * scale
+        self._img.size = (w, h)
+        self._frame.size = (w + dp(8), h + dp(8))
+        self.height = self._frame.height + dp(4)
+
+
 class DateChip(BoxLayout):
     """Centered rounded chip marking a day boundary in the chat history -
     'Today' / 'Yesterday' / '28 Jun 2026'."""
@@ -2209,7 +2335,14 @@ class ChatScreen(Screen):
             elif kind == "call":
                 self.append_event(self._call_log_text(item), timestamp=item["timestamp"])
             elif kind == "file":
-                self.append_event(self._file_log_text(item), timestamp=item["timestamp"])
+                path = item.get("path") or ""
+                if (item["status"] == "completed" and path
+                        and path.lower().endswith(IMAGE_EXTS)
+                        and os.path.exists(path)):
+                    self.append_image(path, mine=item["direction"] == "out",
+                                      timestamp=item["timestamp"])
+                else:
+                    self.append_event(self._file_log_text(item), timestamp=item["timestamp"])
 
     def on_back(self):
         self.manager.transition = SlideTransition(direction="right")
@@ -2328,6 +2461,12 @@ class ChatScreen(Screen):
         self.ids.message_list.add_widget(ChatEvent(text, on_retry=on_retry))
         Clock.schedule_once(lambda dt: setattr(self.ids.chat_scroll, "scroll_y", 0), 0.05)
 
+    def append_image(self, path, mine, timestamp=None):
+        ts = timestamp or time.time()
+        self._maybe_date_chip(ts)
+        self.ids.message_list.add_widget(ChatImageBubble(path, mine))
+        Clock.schedule_once(lambda dt: setattr(self.ids.chat_scroll, "scroll_y", 0), 0.05)
+
     def receive_message(self, msg):
         if self.peer and msg.get("from_id") == self.peer.get("id"):
             self.append_message(msg.get("text", ""), mine=False)
@@ -2336,12 +2475,20 @@ class ChatScreen(Screen):
         if not self.peer or self.peer.get("id") != event.get("peer_id"):
             return
         direction = "in" if event["event"] == "file_received" else "out"
+        path = event.get("path") or ""
+        if (event.get("status") == "completed" and path
+                and path.lower().endswith(IMAGE_EXTS) and os.path.exists(path)):
+            self.append_image(path, mine=direction == "out")
+            return
         row = {"direction": direction, "filename": event["filename"],
                "size": event.get("size", 0), "status": event.get("status", "failed")}
+        text = self._file_log_text(row)
+        if event.get("saved_to"):
+            text += f" – saved to {event['saved_to']}"
         on_retry = None
         if event["event"] == "file_send_failed" and event.get("path"):
             on_retry = lambda: self._start_file_send(event["path"])
-        self.append_event(self._file_log_text(row), on_retry=on_retry)
+        self.append_event(text, on_retry=on_retry)
 
     # No emoji in these lines - Kivy's bundled Roboto has no emoji glyphs,
     # so anything like a paperclip or phone renders as a hollow box.
@@ -2542,6 +2689,15 @@ class LancomApp(App):
                           args=(peer_id, peer.get("ip")), daemon=True).start()
 
     def _on_message_received(self, msg):
+        # Runs on the message server's worker thread. While the app is
+        # backgrounded Kivy's Clock is PAUSED - anything routed through
+        # it sits in the queue until the user reopens the app. So the
+        # notification must fire right here, from this thread; the UI
+        # update still goes through the Clock and catches up on resume.
+        if not self._is_foreground:
+            android_notify.notify_message(msg.get("from_name", "Unknown"),
+                                          msg.get("text", ""))
+            msg["_notified"] = True
         Clock.schedule_once(lambda dt: self._dispatch_message(msg), 0)
 
     def _dispatch_message(self, msg):
@@ -2556,10 +2712,15 @@ class LancomApp(App):
                 self.store.mark_seen_receipts_sent(msg["from_id"], [mid])
                 self.message_server.send_receipt(msg["from_id"], msg.get("ip"),
                                                  [mid], "seen", background=True)
-        else:
+        elif not msg.get("_notified"):
             android_notify.notify_message(msg.get("from_name", "Unknown"), msg.get("text", ""))
 
     def _on_call_event(self, event):
+        # Same Clock-is-paused rule as messages: ring the notification
+        # from the worker thread or a backgrounded phone never rings.
+        if event.get("event") == "incoming_call" and not self._is_foreground:
+            android_notify.notify_incoming_call(event["peer_name"])
+            event["_notified"] = True
         Clock.schedule_once(lambda dt: self._dispatch_call_event(event), 0)
 
     def _dispatch_call_event(self, event):
@@ -2569,7 +2730,7 @@ class LancomApp(App):
             call_screen.on_incoming(event["peer_name"])
             self.root.transition = SlideTransition(direction="up")
             self.root.current = "call"
-            if not self._is_foreground:
+            if not self._is_foreground and not event.get("_notified"):
                 android_notify.notify_incoming_call(event["peer_name"])
         elif kind == "call_ringing":
             call_screen.on_ringing(event["peer_name"])
@@ -2585,6 +2746,10 @@ class LancomApp(App):
             call_screen.on_ended("Call ended")
 
     def _on_file_event(self, event):
+        if (not self._is_foreground and event.get("event") == "file_received"
+                and event.get("status") == "completed"):
+            android_notify.notify_message(event.get("peer_name", "Unknown"),
+                                          f"Sent you {event.get('filename', 'a file')}")
         Clock.schedule_once(lambda dt: self._dispatch_file_event(event), 0)
 
     def _dispatch_file_event(self, event):
