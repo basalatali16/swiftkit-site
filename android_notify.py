@@ -2,26 +2,30 @@
 Android notifications and background-friendliness for LANCOM. No-ops
 everywhere else (desktop testing).
 
-Deliberately does NOT implement a full Android foreground service - that
-needs its own buildozer.spec `services =` entry, a separate service.py
-entry point, and (on API 34+) an explicit foregroundServiceType, which is
-a meaningfully bigger toolchain risk on top of everything else in this
-build. What's here instead is the standard lighter-weight approach: let
-Android know this app is allowed to keep running when backgrounded
-(App.on_pause returning True, wired up in main.py) plus ask the user to
-exempt LANCOM from battery optimization, which is what most non-foreground-
-service background-capable apps rely on. If aggressive OEM battery
-management still kills it, a real foreground service is the next step.
+Kivy-free on purpose: this module is used by BOTH processes - the app
+UI and the foreground service (service.py). Everything resolves its
+Android context at call time via _context(), which returns the activity
+in the app process and the service otherwise.
 """
 
-from kivy.utils import platform
+import os
+
+IS_ANDROID = "ANDROID_ARGUMENT" in os.environ
 
 CHANNEL_MESSAGES = "lancom_messages"
 CHANNEL_CALLS = "lancom_calls"
 
-# Locks held for the app's lifetime (never released on purpose) - kept
-# here so the GC can't collect them, which would release them.
+# Locks held for the process's lifetime (never released on purpose) -
+# kept here so the GC can't collect them, which would release them.
 _held_locks = []
+
+
+def _context():
+    from jnius import autoclass
+    activity = autoclass("org.kivy.android.PythonActivity").mActivity
+    if activity is not None:
+        return activity
+    return autoclass("org.kivy.android.PythonService").mService
 
 
 def acquire_background_locks():
@@ -38,14 +42,13 @@ def acquire_background_locks():
     Deliberately never released: LANCOM's whole job is to be reachable.
     The battery cost is the documented trade-off, softened by the
     battery-optimization exemption the app already asks for."""
-    if platform != "android" or _held_locks:
+    if not IS_ANDROID or _held_locks:
         return
     try:
         from jnius import autoclass
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
         Context = autoclass("android.content.Context")
         PowerManager = autoclass("android.os.PowerManager")
-        app_ctx = PythonActivity.mActivity.getApplicationContext()
+        app_ctx = _context().getApplicationContext()
 
         wifi = app_ctx.getSystemService(Context.WIFI_SERVICE)
         multicast = wifi.createMulticastLock("lancom:multicast")
@@ -64,16 +67,16 @@ def acquire_background_locks():
         wake.acquire()
         _held_locks.append(wake)
     except Exception:
-        pass  # degraded background behavior beats crashing the app
+        pass  # degraded background behavior beats crashing
 
 
 def _get_notification_manager():
     from jnius import autoclass, cast
-    PythonActivity = autoclass("org.kivy.android.PythonActivity")
     Context = autoclass("android.content.Context")
     NotificationManager = autoclass("android.app.NotificationManager")
-    activity = PythonActivity.mActivity
-    return activity, cast(NotificationManager, activity.getSystemService(Context.NOTIFICATION_SERVICE))
+    ctx = _context()
+    return ctx, cast(NotificationManager,
+                     ctx.getSystemService(Context.NOTIFICATION_SERVICE))
 
 
 def _ensure_channel(manager, channel_id, name, importance_high=True):
@@ -92,11 +95,11 @@ def _ensure_channel(manager, channel_id, name, importance_high=True):
 
 
 def _notify(channel_id, channel_name, title, text, notif_id, ringtone=False):
-    if platform != "android":
+    if not IS_ANDROID:
         return
     try:
-        from jnius import autoclass, cast
-        activity, manager = _get_notification_manager()
+        from jnius import autoclass
+        ctx, manager = _get_notification_manager()
         _ensure_channel(manager, channel_id, channel_name)
 
         NotificationBuilder = autoclass("android.app.Notification$Builder")
@@ -104,26 +107,24 @@ def _notify(channel_id, channel_name, title, text, notif_id, ringtone=False):
         String = autoclass("java.lang.String")
         RingtoneManager = autoclass("android.media.RingtoneManager")
 
-        builder = (NotificationBuilder(activity, String(channel_id))
-                   if Build_VERSION.SDK_INT >= 26 else NotificationBuilder(activity))
+        builder = (NotificationBuilder(ctx, String(channel_id))
+                   if Build_VERSION.SDK_INT >= 26 else NotificationBuilder(ctx))
         builder.setContentTitle(String(title))
         builder.setContentText(String(text))
-        builder.setSmallIcon(activity.getApplicationInfo().icon)
+        builder.setSmallIcon(ctx.getApplicationInfo().icon)
         builder.setAutoCancel(True)
         builder.setPriority(2)  # Notification.PRIORITY_MAX, ignored on API 26+ (channel importance rules instead)
 
-        # Tapping the notification brings LANCOM to the foreground
-        # (or launches it) instead of doing nothing.
-        Intent = autoclass("android.content.Intent")
+        # Tapping the notification opens (or foregrounds) LANCOM. The
+        # launch intent works from both the activity and the service.
         PendingIntent = autoclass("android.app.PendingIntent")
-        intent = Intent(activity, activity.getClass())
-        intent.setAction(Intent.ACTION_MAIN)
-        intent.addCategory(Intent.CATEGORY_LAUNCHER)
-        intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        pending = PendingIntent.getActivity(
-            activity, 0, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
-        builder.setContentIntent(pending)
+        launch = ctx.getPackageManager().getLaunchIntentForPackage(
+            ctx.getPackageName())
+        if launch is not None:
+            pending = PendingIntent.getActivity(
+                ctx, 0, launch,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
+            builder.setContentIntent(pending)
 
         sound_type = RingtoneManager.TYPE_RINGTONE if ringtone else RingtoneManager.TYPE_NOTIFICATION
         builder.setSound(RingtoneManager.getDefaultUri(sound_type))
@@ -147,8 +148,9 @@ def request_ignore_battery_optimizations():
     optimization, which otherwise can suspend/kill background network
     activity - needed for messages/calls to arrive reliably while the app
     isn't in the foreground. A system settings dialog, not a runtime
-    permission, so it's requested separately from request_permissions()."""
-    if platform != "android":
+    permission, so it's requested separately from request_permissions().
+    Only callable from the app process (needs the activity)."""
+    if not IS_ANDROID:
         return
     try:
         from jnius import autoclass

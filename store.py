@@ -25,6 +25,10 @@ class Store:
         self._storage_key = storage_key
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # Two processes share this DB on Android (UI reads, the network
+        # service writes). WAL allows that, but momentary lock overlap is
+        # normal - wait it out instead of raising "database is locked".
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
 
     def _init_schema(self):

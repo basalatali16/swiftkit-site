@@ -141,6 +141,42 @@ service running the networking stack in the service process (major
 refactor: UI<->service IPC, service-owned DB writes). Owner asked to
 test the backgrounded-vs-swiped distinction with build #17.
 
+## Foreground service architecture (2026-07-03, v0.5)
+
+Owner confirmed they need WhatsApp-grade background operation: receive
+messages/calls/files with the app CLOSED (swiped away) and phone
+locked. Delivered via a full process split:
+
+- netcore.py (NEW, Kivy-free): all networking - PeerDiscovery,
+  MessageServer (outbox/receipts), CallManager, FileTransferManager,
+  NetworkCore orchestrator emitting one JSON-safe event stream, and
+  EventPolicy (the single notify-vs-mark-seen decision point).
+- service.py (NEW): p4a sticky foreground service entrypoint. Runs
+  NetworkCore + ControlServer, holds the multicast/wifi/wake locks,
+  posts notifications, calls setAutoRestartService(True) so a swiped
+  task comes back. buildozer.spec: `services = lancomnet:service.py:
+  foreground:sticky:foregroundServiceType=dataSync` (+ FOREGROUND_SERVICE,
+  FOREGROUND_SERVICE_DATA_SYNC, WAKE_LOCK permissions).
+- lancom_ipc.py (NEW): localhost:55560 control channel, newline-JSON,
+  token = sha256(identity storage key + "lancom-control") so only this
+  app's processes can connect. ControlClient auto-reconnects and
+  replays state (start/set_view/call_state) after every connect.
+- lancom_app.py: UI only. DirectBackend (desktop, in-process core) /
+  ServiceBackend (Android, IPC client) behind one method surface.
+  UI reads history straight from the shared SQLite DB (WAL +
+  busy_timeout=5000 in store.py for cross-process safety); ALL writes
+  happen in the networking process.
+- android_notify.py: Kivy-free, context-agnostic (activity OR service),
+  notifications now open the app when tapped (getLaunchIntentForPackage).
+
+Verified locally: py_compile all; IPC handshake/broadcast/bad-token
+test; two-process probe test; two-process store-and-forward messaging
+test (pending->delivered->seen, dedup); windowed UI smoke with
+screenshots. NOT yet verified on a phone.
+
+Data-path note: both processes resolve the same files dir (Kivy
+user_data_dir == ANDROID_PRIVATE on android), so identity/DB carry over.
+
 ## Next steps
 
 1. A new CI build was pushed after these changes — check its result on
