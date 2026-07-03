@@ -26,7 +26,7 @@ import time
 
 from kivy.app import App
 from kivy.clock import Clock
-from kivy.graphics import Color, RoundedRectangle
+from kivy.graphics import Color, Ellipse, RoundedRectangle
 from kivy.lang import Builder
 from kivy.metrics import dp
 from kivy.properties import StringProperty, BooleanProperty
@@ -36,6 +36,8 @@ from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.screenmanager import Screen, SlideTransition
+from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
 from kivy.utils import platform, escape_markup
 
 import android_notify
@@ -69,6 +71,8 @@ COLOR_TEXT_DIM = (0.58, 0.58, 0.64, 1)
 COLOR_ONLINE = (0.36, 0.82, 0.55, 1)
 COLOR_OFFLINE = (0.46, 0.46, 0.52, 1)
 COLOR_DANGER = (0.80, 0.28, 0.28, 1)
+COLOR_BUBBLE_MINE = (0.27, 0.22, 0.12, 1)  # own messages - warm gold-dark
+COLOR_CHIP = (0.10, 0.115, 0.17, 1)  # date separator chips
 
 AVATAR_COLORS = [
     (0.72, 0.45, 0.20), (0.30, 0.48, 0.75), (0.52, 0.36, 0.75),
@@ -92,6 +96,21 @@ def format_last_seen(ts):
     if delta < 86400:
         return f"{int(delta // 3600)}h ago"
     return f"{int(delta // 86400)}d ago"
+
+
+def format_time(ts):
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def format_date_chip(ts):
+    day = time.localtime(ts)
+    today = time.localtime()
+    if (day.tm_year, day.tm_yday) == (today.tm_year, today.tm_yday):
+        return "Today"
+    yesterday = time.localtime(time.time() - 86400)
+    if (day.tm_year, day.tm_yday) == (yesterday.tm_year, yesterday.tm_yday):
+        return "Yesterday"
+    return time.strftime("%d %b %Y", day)
 
 
 def format_size(n):
@@ -484,9 +503,27 @@ class PeerDiscovery:
         self.peers = {}  # device_id -> {"name", "ip", "last_seen"} (currently live only)
         self._lock = threading.Lock()
         self._running = False
+        self._listen_sock = None
 
     def start(self):
         self._running = True
+        # The listen socket doubles as the source socket for unicast probes
+        # and probe replies: packets sent from it carry our discovery port
+        # as their source port, so the other side can answer straight back
+        # to the packet's source address and hit our listener - no extra
+        # port negotiation on the wire.
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            except OSError:
+                pass
+            sock.bind(("", BROADCAST_PORT))
+            sock.settimeout(1.0)
+            self._listen_sock = sock
+        except OSError:
+            self._listen_sock = None
         threading.Thread(target=self._broadcast_loop, daemon=True).start()
         threading.Thread(target=self._listen_loop, daemon=True).start()
         threading.Thread(target=self._reap_loop, daemon=True).start()
@@ -494,34 +531,66 @@ class PeerDiscovery:
     def stop(self):
         self._running = False
 
-    def _broadcast_loop(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    def _hello_data(self, probe=False):
         payload = {
             "type": "LANCOM_HELLO",
             "id": IDENTITY.peer_id,
             "name": self.display_name,
             "pubkey": base64.b64encode(IDENTITY.public_bytes).decode("ascii"),
         }
-        data = json.dumps(payload).encode("utf-8")
+        if probe:
+            payload["probe"] = True
+        return json.dumps(payload).encode("utf-8")
+
+    def probe_ip(self, ip, port=None):
+        """Announce ourselves directly (unicast) to one specific address and
+        ask it to announce back. This is the discovery path for networks
+        where the router filters UDP broadcast - both sides learn each
+        other from a single probe, no broadcast required."""
+        sock = self._listen_sock
+        if sock is None:
+            return False
+        try:
+            sock.sendto(self._hello_data(probe=True),
+                        (ip, port if port is not None else BROADCAST_PORT))
+            return True
+        except OSError:
+            return False
+
+    def _reprobe_stale_peers(self):
+        """Unicast HELLOs to known contacts we haven't heard from recently.
+        On broadcast-filtering networks this is what keeps contacts online
+        (and re-finds stored ones after an app restart): their replies
+        refresh last_seen before the reaper would flag them offline."""
+        now = time.time()
+        with self._lock:
+            fresh = {pid for pid, p in self.peers.items()
+                     if now - p["last_seen"] <= PEER_TIMEOUT / 2}
+        try:
+            known = self.store.get_known_peers()
+        except Exception:
+            return
+        for p in known:
+            if p["id"] not in fresh and p.get("ip"):
+                self.probe_ip(p["ip"])
+
+    def _broadcast_loop(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         while self._running:
             try:
-                sock.sendto(data, (self.broadcast_ip, BROADCAST_PORT))
+                sock.sendto(self._hello_data(), (self.broadcast_ip, BROADCAST_PORT))
             except OSError:
                 pass
+            self._reprobe_stale_peers()
             time.sleep(BROADCAST_INTERVAL)
         sock.close()
 
     def _listen_loop(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        except OSError:
-            pass
-        sock.bind(("", BROADCAST_PORT))
-        sock.settimeout(1.0)
+        sock = self._listen_sock
+        if sock is None:
+            return
         while self._running:
             try:
                 data, addr = sock.recvfrom(2048)
@@ -558,6 +627,14 @@ class PeerDiscovery:
                     "last_seen": time.time(),
                 }
             self.store.upsert_peer(peer_id, name, addr[0], pubkey_b64)
+            if msg.get("probe"):
+                # A directed probe means our broadcasts likely never reach
+                # this device - answer straight back to the packet's source
+                # (their listen socket) so it learns us too.
+                try:
+                    sock.sendto(self._hello_data(), addr)
+                except OSError:
+                    pass
         sock.close()
 
     def _reap_loop(self):
@@ -1257,23 +1334,72 @@ ScreenManager:
 <LuxButton@Button>:
     background_normal: ""
     background_down: ""
-    background_color: 0.83, 0.69, 0.42, 1
+    background_color: 0, 0, 0, 0
     color: 0.05, 0.06, 0.1, 1
     bold: True
+    canvas.before:
+        Color:
+            rgba: (0.64, 0.52, 0.30, 1) if self.state == "down" else (0.83, 0.69, 0.42, 1)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
 
 <GhostButton@Button>:
     background_normal: ""
     background_down: ""
-    background_color: 0.12, 0.14, 0.21, 1
+    background_color: 0, 0, 0, 0
     color: 0.83, 0.69, 0.42, 1
     bold: True
+    canvas.before:
+        Color:
+            rgba: (0.18, 0.21, 0.30, 1) if self.state == "down" else (0.12, 0.14, 0.21, 1)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
 
 <DangerButton@Button>:
     background_normal: ""
     background_down: ""
-    background_color: 0.80, 0.28, 0.28, 1
+    background_color: 0, 0, 0, 0
     color: 1, 1, 1, 1
     bold: True
+    canvas.before:
+        Color:
+            rgba: (0.60, 0.20, 0.20, 1) if self.state == "down" else (0.80, 0.28, 0.28, 1)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
+
+<PillGhostButton@Button>:
+    background_normal: ""
+    background_down: ""
+    background_color: 0, 0, 0, 0
+    color: 0.83, 0.69, 0.42, 1
+    bold: True
+    canvas.before:
+        Color:
+            rgba: (0.18, 0.21, 0.30, 1) if self.state == "down" else (0.12, 0.14, 0.21, 1)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [self.height / 2.0]
+
+<PillLuxButton@Button>:
+    background_normal: ""
+    background_down: ""
+    background_color: 0, 0, 0, 0
+    color: 0.05, 0.06, 0.1, 1
+    bold: True
+    canvas.before:
+        Color:
+            rgba: (0.64, 0.52, 0.30, 1) if self.state == "down" else (0.83, 0.69, 0.42, 1)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [self.height / 2.0]
 
 <SetupScreen>:
     name: "setup"
@@ -1350,13 +1476,22 @@ ScreenManager:
             size_hint_y: None
             height: dp(56)
             padding: dp(16), dp(8)
+            spacing: dp(8)
             Label:
                 text: "LANCOM"
                 bold: True
                 font_size: dp(20)
                 color: 0.83, 0.69, 0.42, 1
                 halign: "left"
+                valign: "middle"
                 text_size: self.size
+            GhostButton:
+                text: "+ IP"
+                size_hint: None, None
+                width: dp(68)
+                height: dp(36)
+                pos_hint: {"center_y": 0.5}
+                on_release: root.show_add_ip_popup()
 
         Label:
             id: debug_info
@@ -1388,8 +1523,8 @@ ScreenManager:
 
         BoxLayout:
             size_hint_y: None
-            height: dp(56)
-            padding: dp(8)
+            height: dp(52)
+            padding: dp(6), dp(6)
             spacing: dp(8)
             canvas.before:
                 Color:
@@ -1398,23 +1533,24 @@ ScreenManager:
                     pos: self.pos
                     size: self.size
             GhostButton:
-                text: "< Back"
+                text: "‹"
+                font_size: dp(26)
                 size_hint_x: None
-                width: dp(80)
+                width: dp(44)
                 on_release: root.on_back()
             BoxLayout:
                 orientation: "vertical"
                 Label:
                     text: root.peer_name
                     bold: True
-                    font_size: dp(17)
+                    font_size: dp(16)
                     color: 0.94, 0.93, 0.90, 1
                     halign: "left"
                     text_size: self.size
                     valign: "bottom"
                 Label:
-                    text: "\U0001F512 " + root.peer_status
-                    font_size: dp(11)
+                    text: root.peer_status
+                    font_size: dp(10)
                     color: (0.36, 0.82, 0.55, 1) if root.peer_online else (0.46, 0.46, 0.52, 1)
                     halign: "left"
                     text_size: self.size
@@ -1422,12 +1558,12 @@ ScreenManager:
             GhostButton:
                 text: "ID"
                 size_hint_x: None
-                width: dp(40)
+                width: dp(44)
                 on_release: root.show_fingerprint()
             LuxButton:
                 text: "Call"
                 size_hint_x: None
-                width: dp(64)
+                width: dp(60)
                 disabled: not root.peer_online
                 opacity: 1 if root.peer_online else 0.4
                 on_release: root.on_call()
@@ -1440,31 +1576,44 @@ ScreenManager:
                 size_hint_y: None
                 height: self.minimum_height
                 padding: dp(10)
-                spacing: dp(8)
+                spacing: dp(5)
 
         BoxLayout:
             size_hint_y: None
-            height: dp(56)
-            padding: dp(8)
+            height: dp(60)
+            padding: dp(8), dp(8)
             spacing: dp(8)
-            GhostButton:
-                text: "File"
+            PillGhostButton:
+                text: "+"
+                font_size: dp(26)
                 size_hint_x: None
-                width: dp(56)
+                width: dp(44)
                 on_release: root.on_send_file()
-            TextInput:
-                id: chat_input
-                multiline: False
-                hint_text: "Message"
-                background_color: 0.075, 0.086, 0.13, 1
-                foreground_color: 0.94, 0.93, 0.90, 1
-                hint_text_color: 0.5, 0.5, 0.55, 1
-                cursor_color: 0.83, 0.69, 0.42, 1
-                on_text_validate: root.on_send(chat_input.text)
-            LuxButton:
+            BoxLayout:
+                padding: dp(14), dp(4)
+                canvas.before:
+                    Color:
+                        rgba: 0.075, 0.086, 0.13, 1
+                    RoundedRectangle:
+                        pos: self.pos
+                        size: self.size
+                        radius: [self.height / 2.0]
+                TextInput:
+                    id: chat_input
+                    multiline: False
+                    hint_text: "Message"
+                    background_normal: ""
+                    background_active: ""
+                    background_color: 0, 0, 0, 0
+                    foreground_color: 0.94, 0.93, 0.90, 1
+                    hint_text_color: 0.5, 0.5, 0.55, 1
+                    cursor_color: 0.83, 0.69, 0.42, 1
+                    padding: dp(4), max(0, (self.height - self.line_height) / 2)
+                    on_text_validate: root.on_send(chat_input.text)
+            PillLuxButton:
                 text: "Send"
                 size_hint_x: None
-                width: dp(70)
+                width: dp(64)
                 on_release: root.on_send(chat_input.text)
 
 <CallScreen>:
@@ -1529,18 +1678,60 @@ class SetupScreen(Screen):
 
 
 class Avatar(Label):
-    def __init__(self, name, **kwargs):
+    """Colored initial tile. Pass online=True/False to draw a status dot on
+    the bottom-right corner - a drawn circle, not a text glyph, because
+    Kivy's bundled Roboto has no dot/emoji characters (they render as
+    hollow boxes)."""
+
+    DOT = 13
+
+    def __init__(self, name, online=None, **kwargs):
         color = _color_for_name(name or "?")
         super().__init__(text=(name[:1] or "?").upper(), bold=True, color=(1, 1, 1, 1),
                           size_hint=(None, None), size=(dp(44), dp(44)), **kwargs)
+        self._dot = self._dot_ring = None
         with self.canvas.before:
             Color(*color)
             self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(10)])
+        if online is not None:
+            with self.canvas.after:
+                # Dark ring behind the dot so it reads against any avatar color.
+                Color(*COLOR_BG)
+                self._dot_ring = Ellipse(pos=self.pos, size=(dp(self.DOT + 4),) * 2)
+                Color(*(COLOR_ONLINE if online else COLOR_OFFLINE))
+                self._dot = Ellipse(pos=self.pos, size=(dp(self.DOT),) * 2)
         self.bind(pos=self._sync, size=self._sync)
 
     def _sync(self, *_args):
         self._rect.pos = self.pos
         self._rect.size = self.size
+        if self._dot is not None:
+            self._dot_ring.pos = (self.right - dp(self.DOT + 3), self.y - dp(2))
+            self._dot.pos = (self.right - dp(self.DOT + 1), self.y)
+
+
+class RoundButton(Button):
+    """Flat rounded-rectangle button with a visibly darker pressed state -
+    the Python-side counterpart of the KV Lux/Ghost/Danger button rules,
+    for widgets that are built in code rather than in the KV string."""
+
+    def __init__(self, bg, radius=None, **kwargs):
+        super().__init__(background_normal="", background_down="",
+                          background_color=(0, 0, 0, 0), **kwargs)
+        self._bg = bg
+        self._bg_down = tuple(c * 0.75 for c in bg[:3]) + (bg[3],)
+        with self.canvas.before:
+            self._color = Color(*bg)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size,
+                                           radius=radius or [dp(12)])
+        self.bind(pos=self._sync, size=self._sync, state=self._on_state)
+
+    def _sync(self, *_args):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+
+    def _on_state(self, _inst, state):
+        self._color.rgba = self._bg_down if state == "down" else self._bg
 
 
 class ContactRow(BoxLayout):
@@ -1555,32 +1746,39 @@ class ContactRow(BoxLayout):
             self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])
         self.bind(pos=self._sync, size=self._sync)
 
-        self.add_widget(Avatar(peer["name"]))
+        self.add_widget(Avatar(peer["name"], online=online,
+                                pos_hint={"center_y": 0.5}))
 
         info = BoxLayout(orientation="vertical", spacing=dp(2))
+        # shorten=True keeps each line single-height with a trailing
+        # ellipsis instead of letter-wrapping when a name outgrows the
+        # space between the avatar and the buttons.
         name_label = Label(text=escape_markup(peer["name"]), bold=True, font_size=dp(15),
                             color=(0.94, 0.93, 0.90, 1), halign="left", valign="bottom",
-                            size_hint_y=0.55)
+                            shorten=True, shorten_from="right", size_hint_y=0.55)
         name_label.bind(size=lambda inst, val: setattr(inst, "text_size", val))
-        status_text = "● Online" if online else f"○ Last seen {format_last_seen(peer.get('last_seen'))}"
+        status_text = "Online" if online else f"Last seen {format_last_seen(peer.get('last_seen'))}"
         status_color = (0.36, 0.82, 0.55, 1) if online else (0.46, 0.46, 0.52, 1)
         status_label = Label(text=status_text, font_size=dp(12), color=status_color,
-                              halign="left", valign="top", size_hint_y=0.45)
+                              halign="left", valign="top", shorten=True,
+                              shorten_from="right", size_hint_y=0.45)
         status_label.bind(size=lambda inst, val: setattr(inst, "text_size", val))
         info.add_widget(name_label)
         info.add_widget(status_label)
         self.add_widget(info)
 
-        chat_btn = Button(text="Chat", size_hint_x=None, width=dp(64),
-                           background_normal="", background_color=(0.12, 0.14, 0.21, 1),
-                           color=(0.83, 0.69, 0.42, 1), bold=True)
+        chat_btn = RoundButton(bg=(0.12, 0.14, 0.21, 1), text="Chat",
+                                size_hint=(None, None), size=(dp(56), dp(38)),
+                                pos_hint={"center_y": 0.5}, font_size=dp(13),
+                                color=(0.83, 0.69, 0.42, 1), bold=True)
         chat_btn.bind(on_release=lambda *_: on_open_chat(peer))
         self.add_widget(chat_btn)
 
-        call_btn = Button(text="Call", size_hint_x=None, width=dp(64), disabled=not online,
-                           opacity=1 if online else 0.35,
-                           background_normal="", background_color=(0.83, 0.69, 0.42, 1),
-                           color=(0.05, 0.06, 0.1, 1), bold=True)
+        call_btn = RoundButton(bg=(0.83, 0.69, 0.42, 1), text="Call",
+                                size_hint=(None, None), size=(dp(56), dp(38)),
+                                pos_hint={"center_y": 0.5}, disabled=not online,
+                                opacity=1 if online else 0.35, font_size=dp(13),
+                                color=(0.05, 0.06, 0.1, 1), bold=True)
         call_btn.bind(on_release=lambda *_: on_call(peer))
         self.add_widget(call_btn)
 
@@ -1615,6 +1813,56 @@ class UsersScreen(Screen):
         for peer in peers:
             container.add_widget(ContactRow(peer, self.open_chat, self.call_peer))
 
+    def show_add_ip_popup(self):
+        """Manual fallback for networks where the router filters UDP
+        broadcast, so devices never see each other automatically: type the
+        other device's IP (shown in its own debug line on this screen) and
+        we probe it directly."""
+        app = App.get_running_app()
+        content = BoxLayout(orientation="vertical", spacing=dp(10),
+                             padding=(dp(8), dp(8)))
+        hint = Label(
+            text=("If devices on this network can't find each other "
+                  "automatically, type the other device's IP address. "
+                  "It's shown at the top of their contacts screen."),
+            font_size=dp(12), color=COLOR_TEXT_DIM, halign="center",
+            valign="middle", size_hint_y=None, height=dp(64))
+        hint.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        ip_input = TextInput(
+            hint_text="e.g. 192.168.1.23", multiline=False,
+            size_hint_y=None, height=dp(44), padding=(dp(12), dp(12)),
+            background_color=COLOR_CARD, foreground_color=COLOR_TEXT,
+            hint_text_color=(0.5, 0.5, 0.55, 1), cursor_color=COLOR_GOLD,
+            input_filter=lambda s, _undo: "".join(c for c in s if c in "0123456789."),
+        )
+        error = Label(text="", font_size=dp(12), color=COLOR_DANGER,
+                       size_hint_y=None, height=dp(18))
+        add_btn = RoundButton(bg=COLOR_GOLD, text="Add device", bold=True,
+                               color=(0.05, 0.06, 0.1, 1),
+                               size_hint_y=None, height=dp(44))
+        content.add_widget(hint)
+        content.add_widget(ip_input)
+        content.add_widget(error)
+        content.add_widget(add_btn)
+        popup = Popup(title="Add device by IP", content=content,
+                       size_hint=(0.92, None), height=dp(300))
+
+        def do_add(*_args):
+            ip = ip_input.text.strip()
+            parts = ip.split(".")
+            valid = (len(parts) == 4
+                     and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+            if not valid:
+                error.text = "That doesn't look like a valid IP address"
+                return
+            if app.discovery:
+                app.discovery.probe_ip(ip)
+            popup.dismiss()
+
+        add_btn.bind(on_release=do_add)
+        ip_input.bind(on_text_validate=do_add)
+        popup.open()
+
     def open_chat(self, peer):
         chat = self.manager.get_screen("chat")
         chat.set_peer(peer)
@@ -1628,18 +1876,91 @@ class UsersScreen(Screen):
 
 
 class ChatBubble(BoxLayout):
-    def __init__(self, text, sender, mine, **kwargs):
-        super().__init__(orientation="vertical", size_hint_y=None, **kwargs)
-        safe_sender = escape_markup(sender)
-        safe_text = escape_markup(text)
-        label = Label(text=f"[b]{safe_sender}[/b]\n{safe_text}", markup=True,
-                      color=(0.94, 0.93, 0.90, 1),
-                      halign="left" if not mine else "right",
-                      size_hint_y=None)
-        label.bind(texture_size=lambda inst, val: setattr(label, "height", val[1] + 10))
-        label.bind(width=lambda inst, val: setattr(label, "text_size", (val, None)))
-        self.add_widget(label)
-        self.bind(minimum_height=self.setter("height"))
+    """WhatsApp-style rounded message bubble. Own messages sit right in a
+    warm gold-dark bubble, the peer's sit left in a card-colored one, and
+    the timestamp renders small and dim inside the bubble after the text.
+    No sender name - chats here are always 1:1 and the header says who."""
+
+    MAX_FRAC = 0.75  # bubble never grows past this fraction of the row
+    PAD_X = 12
+    PAD_Y = 8
+
+    def __init__(self, text, mine, timestamp=None, **kwargs):
+        super().__init__(orientation="horizontal", size_hint_y=None,
+                          padding=(dp(2), dp(1)), **kwargs)
+        body = escape_markup(text)
+        if timestamp:
+            body += (f" [size={int(dp(10))}][color=#9a93a4]"
+                     f"{format_time(timestamp)}[/color][/size]")
+
+        self._label = Label(text=body, markup=True, color=COLOR_TEXT,
+                             halign="left", size_hint=(None, None))
+        self._bubble = BoxLayout(size_hint=(None, None),
+                                  padding=(dp(self.PAD_X), dp(self.PAD_Y)))
+        with self._bubble.canvas.before:
+            Color(*(COLOR_BUBBLE_MINE if mine else COLOR_CARD))
+            # Tighter corner on the side the bubble "points" from, like a
+            # speech-bubble tail. Radius order: TL, TR, BR, BL.
+            radius = ([dp(14), dp(14), dp(4), dp(14)] if mine
+                      else [dp(14), dp(14), dp(14), dp(4)])
+            self._rect = RoundedRectangle(pos=self._bubble.pos,
+                                           size=self._bubble.size, radius=radius)
+        self._bubble.bind(pos=self._sync, size=self._sync)
+        self._bubble.add_widget(self._label)
+
+        if mine:
+            self.add_widget(Widget())
+            self.add_widget(self._bubble)
+        else:
+            self.add_widget(self._bubble)
+            self.add_widget(Widget())
+
+        self.bind(width=self._relayout)
+        self._relayout()
+
+    def _sync(self, *_args):
+        self._rect.pos = self._bubble.pos
+        self._rect.size = self._bubble.size
+
+    def _relayout(self, *_args):
+        """Size the bubble to its text: unwrap, measure the natural width,
+        and only wrap when it exceeds the max fraction of the row."""
+        max_w = max(self.width * self.MAX_FRAC - dp(2 * self.PAD_X), dp(60))
+        if self._label.text_size[0] is not None:
+            self._label.text_size = (None, None)
+        self._label.texture_update()
+        if self._label.texture_size[0] > max_w:
+            self._label.text_size = (max_w, None)
+            self._label.texture_update()
+        tw, th = self._label.texture_size
+        self._label.size = (tw, th)
+        self._bubble.size = (tw + dp(2 * self.PAD_X), th + dp(2 * self.PAD_Y))
+        self.height = self._bubble.height + dp(2)
+
+
+class DateChip(BoxLayout):
+    """Centered rounded chip marking a day boundary in the chat history -
+    'Today' / 'Yesterday' / '28 Jun 2026'."""
+
+    def __init__(self, text, **kwargs):
+        super().__init__(orientation="horizontal", size_hint_y=None,
+                          height=dp(32), padding=(0, dp(5)), **kwargs)
+        self._label = Label(text=text, font_size=dp(11), bold=True,
+                             color=(0.62, 0.62, 0.68, 1), size_hint=(None, None))
+        self._label.bind(texture_size=lambda inst, val: setattr(
+            inst, "size", (val[0] + dp(20), dp(22))))
+        with self._label.canvas.before:
+            Color(*COLOR_CHIP)
+            self._rect = RoundedRectangle(pos=self._label.pos,
+                                           size=self._label.size, radius=[dp(11)])
+        self._label.bind(pos=self._sync, size=self._sync)
+        self.add_widget(Widget())
+        self.add_widget(self._label)
+        self.add_widget(Widget())
+
+    def _sync(self, *_args):
+        self._rect.pos = self._label.pos
+        self._rect.size = self._label.size
 
 
 class ChatEvent(BoxLayout):
@@ -1655,9 +1976,10 @@ class ChatEvent(BoxLayout):
         label.bind(width=lambda inst, val: setattr(label, "text_size", (val, None)))
         self.add_widget(label)
         if on_retry:
-            retry_btn = Button(text="Retry", size_hint=(None, None), size=(dp(70), dp(28)),
-                                background_normal="", background_color=(0.83, 0.69, 0.42, 1),
-                                color=(0.05, 0.06, 0.1, 1), font_size=dp(11), bold=True)
+            retry_btn = RoundButton(bg=(0.83, 0.69, 0.42, 1), text="Retry",
+                                     size_hint=(None, None), size=(dp(72), dp(28)),
+                                     pos_hint={"center_x": 0.5}, radius=[dp(14)],
+                                     color=(0.05, 0.06, 0.1, 1), font_size=dp(11), bold=True)
             retry_btn.bind(on_release=lambda *_: on_retry())
             self.add_widget(retry_btn)
         self.bind(minimum_height=self.setter("height"))
@@ -1668,12 +1990,14 @@ class ChatScreen(Screen):
     peer_status = StringProperty("")
     peer_online = BooleanProperty(False)
     peer = None
+    _last_day = None
 
     def set_peer(self, peer):
         self.peer = peer
         self.peer_name = peer["name"]
         self.peer_online = bool(peer.get("online"))
         self.peer_status = "Online" if self.peer_online else f"Last seen {format_last_seen(peer.get('last_seen'))}"
+        self._last_day = None
         self.ids.message_list.clear_widgets()
         self.load_history()
 
@@ -1691,12 +2015,11 @@ class ChatScreen(Screen):
         for _ts, kind, item in items:
             if kind == "message":
                 mine = item["direction"] == "out"
-                sender = app.display_name if mine else self.peer_name
-                self.append_message(sender, item["text"], mine=mine)
+                self.append_message(item["text"], mine=mine, timestamp=item["timestamp"])
             elif kind == "call":
-                self.append_event(self._call_log_text(item))
+                self.append_event(self._call_log_text(item), timestamp=item["timestamp"])
             elif kind == "file":
-                self.append_event(self._file_log_text(item))
+                self.append_event(self._file_log_text(item), timestamp=item["timestamp"])
 
     def on_back(self):
         self.manager.transition = SlideTransition(direction="right")
@@ -1744,7 +2067,7 @@ class ChatScreen(Screen):
                 Clock.schedule_once(lambda dt: self._on_send_failed(peer_name), 0)
 
         threading.Thread(target=do_send, daemon=True).start()
-        self.append_message(app.display_name, text, mine=True)
+        self.append_message(text, mine=True)
         self.ids.chat_input.text = ""
 
     def on_send_file(self):
@@ -1781,20 +2104,29 @@ class ChatScreen(Screen):
 
     def _on_send_failed(self, peer_name):
         if self.peer_name == peer_name:
-            self.append_message("System", "Failed to send: peer unreachable", mine=False)
+            self.append_event("Couldn't deliver - device unreachable")
 
-    def append_message(self, sender, text, mine):
-        bubble = ChatBubble(text, sender, mine)
-        self.ids.message_list.add_widget(bubble)
+    def _maybe_date_chip(self, ts):
+        day = time.localtime(ts)[:3]
+        if day != self._last_day:
+            self._last_day = day
+            self.ids.message_list.add_widget(DateChip(format_date_chip(ts)))
+
+    def append_message(self, text, mine, timestamp=None):
+        ts = timestamp or time.time()
+        self._maybe_date_chip(ts)
+        self.ids.message_list.add_widget(ChatBubble(text, mine, timestamp=ts))
         Clock.schedule_once(lambda dt: setattr(self.ids.chat_scroll, "scroll_y", 0), 0.05)
 
-    def append_event(self, text, on_retry=None):
+    def append_event(self, text, on_retry=None, timestamp=None):
+        ts = timestamp or time.time()
+        self._maybe_date_chip(ts)
         self.ids.message_list.add_widget(ChatEvent(text, on_retry=on_retry))
         Clock.schedule_once(lambda dt: setattr(self.ids.chat_scroll, "scroll_y", 0), 0.05)
 
     def receive_message(self, msg):
         if self.peer and msg.get("from_id") == self.peer.get("id"):
-            self.append_message(msg.get("from_name", "Unknown"), msg.get("text", ""), mine=False)
+            self.append_message(msg.get("text", ""), mine=False)
 
     def receive_file_event(self, event):
         if not self.peer or self.peer.get("id") != event.get("peer_id"):
@@ -1807,27 +2139,27 @@ class ChatScreen(Screen):
             on_retry = lambda: self._start_file_send(event["path"])
         self.append_event(self._file_log_text(row), on_retry=on_retry)
 
+    # No emoji in these lines - Kivy's bundled Roboto has no emoji glyphs,
+    # so anything like a paperclip or phone renders as a hollow box.
     @staticmethod
     def _call_log_text(c):
-        icon = "\U0001F4DE"
         if c["outcome"] == "missed":
-            return f"{icon} Missed call"
+            return "Missed call"
         if c["outcome"] == "rejected":
-            return f"{icon} Call declined"
+            return "Call declined"
         if c["outcome"] in ("failed", "cancelled"):
-            return f"{icon} Call not connected"
+            return "Call not connected"
         mins, secs = divmod(int(c["duration"] or 0), 60)
         which = "Outgoing" if c["direction"] == "out" else "Incoming"
-        return f"{icon} {which} call – {mins:02d}:{secs:02d}"
+        return f"{which} call – {mins:02d}:{secs:02d}"
 
     @staticmethod
     def _file_log_text(f):
-        icon = "\U0001F4CE"
         which = "Sent" if f["direction"] == "out" else "Received"
         size_str = format_size(f["size"])
         if f["status"] != "completed":
-            return f"{icon} {which} {f['filename']} ({size_str}) – failed"
-        return f"{icon} {which} {f['filename']} ({size_str})"
+            return f"{which} {f['filename']} ({size_str}) – failed"
+        return f"{which} {f['filename']} ({size_str})"
 
 
 class CallScreen(Screen):

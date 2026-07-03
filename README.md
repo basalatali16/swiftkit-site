@@ -11,6 +11,15 @@ UDP; any other device running the app on the same WiFi will show up in the
 device list within a couple of seconds. From there you can send text
 messages, share files, or start a voice call.
 
+On networks where the router filters UDP broadcast (common in offices),
+automatic discovery can't work — use the "+ IP" button on the contacts
+screen and type the other device's IP address (each device shows its own
+IP at the top of that screen). This sends a direct unicast HELLO probe;
+the other device answers straight back, so both sides learn each other
+from one probe. Known contacts that go quiet are also re-probed directly
+every broadcast interval, which keeps contacts online (and re-finds them
+after an app restart) without any broadcast traffic at all.
+
 Every contact you've ever seen — online or not — stays in your device list
 with an online/offline status and a "last seen" time, and every message,
 call, and file transfer is saved locally (SQLite, in the app's private
