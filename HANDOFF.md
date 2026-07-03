@@ -94,6 +94,32 @@ open).
   network security; proposed license-key activation as the real
   anti-piracy feature (not built yet - awaiting owner decision).
 
+## Feature round 2 (2026-07-03, after owner's first device test)
+
+Build #15 booted fine on device (crash fix confirmed). Owner feedback
+round implemented in v0.3 (build #16):
+
+- Multicast/Wifi/Wake locks (android_notify.acquire_background_locks):
+  MulticastLock is REQUIRED for receiving UDP broadcast on Android at
+  all; wifi+wake locks keep networking alive in background. New perms:
+  WAKE_LOCK, CHANGE_WIFI_MULTICAST_STATE.
+- Store-and-forward outbox: queue_message/flush_outbox on
+  MessageServer; flush on send, on chat open, and on discovery's new
+  on_peer_online callback. msg_id dedup on receive; RECEIPT frames
+  (delivered/seen) on the message port; WhatsApp ticks in bubbles
+  ("…"/gray ✓✓/gold ✓✓) via bundled DejaVuSans (Roboto lacks U+2713;
+  fonts dir is NOT on resource path - resolve via kivy.__file__).
+- Notification tap opens the app (contentIntent).
+- Call status: "Ringing..." when INVITE lands, "busy on another call".
+- File picker: SAF ACTION_OPEN_DOCUMENT via android.activity result
+  binding (plyer filechooser broken on API 33+); content:// copy moved
+  off the UI thread.
+- Tests: msg_peer.py two-process store-and-forward test passed
+  (offline queue -> reconnect delivery -> dedup -> delivered/seen);
+  probe test re-passed; UI smoke re-passed with tick rendering.
+- Owner's file-share crash screenshot never arrived (attach failed
+  twice); SAF picker most likely fixes it, but confirm on device.
+
 ## Next steps
 
 1. A new CI build was pushed after these changes — check its result on
