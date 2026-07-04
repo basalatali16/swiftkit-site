@@ -24,6 +24,7 @@ import time
 
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.core.window import Window
 from kivy.graphics import Color, Ellipse, RoundedRectangle
 from kivy.lang import Builder
 from kivy.metrics import dp
@@ -44,7 +45,8 @@ from kivy.utils import platform, escape_markup
 import android_notify
 import crypto_util
 from lancom_ipc import ControlClient, control_token
-from netcore import IMAGE_EXTS, EventPolicy, NetworkCore
+from netcore import (IMAGE_EXTS, EventPolicy, FileTransferManager,
+                     NetworkCore)
 from store import Store
 
 # "Colorful luxury" palette - deep indigo night, royal violet primary,
@@ -277,6 +279,9 @@ class DirectBackend:
     def clear_chat(self, peer_id):
         self.core.clear_chat(peer_id)
 
+    def pending_transfers(self, peer_id):
+        return self.core.pending_transfers(peer_id)
+
     def call(self, peer_id, peer_ip, peer_name):
         return self.core.call(peer_id, peer_ip, peer_name)
 
@@ -378,6 +383,11 @@ class ServiceBackend:
 
     def clear_chat(self, peer_id):
         self.client.request({"cmd": "clear_chat", "peer_id": peer_id})
+
+    def pending_transfers(self, peer_id):
+        reply = self.client.request({"cmd": "pending_transfers",
+                                     "peer_id": peer_id})
+        return reply.get("transfers", []) if reply else []
 
     def call(self, peer_id, peer_ip, peer_name):
         reply = self.client.request({"cmd": "call", "peer_id": peer_id,
@@ -1374,6 +1384,149 @@ class ChatImageBubble(BoxLayout):
         self.height = self._frame.height + dp(4)
 
 
+class FileBubble(BoxLayout):
+    """WhatsApp-style file card: filename + live status line (Preparing /
+    Sending 37% / Receiving / Delivered / Seen / Failed / Interrupted)
+    with a slim progress bar and an optional Retry/Resume button."""
+
+    CARD_W = 240
+
+    def __init__(self, filename, size, mine, transfer_id=None,
+                 on_action=None, **kwargs):
+        super().__init__(orientation="horizontal", size_hint_y=None,
+                          padding=(dp(2), dp(2)), **kwargs)
+        self.transfer_id = transfer_id
+        self.filename = filename
+        self.file_size = size or 0
+        self.src_path = None  # sender-side source file for Retry/Resume
+        self._mine = mine
+        self._on_action = on_action
+        self._frac = 0.0
+
+        card = BoxLayout(orientation="vertical", size_hint=(None, None),
+                          width=dp(self.CARD_W), padding=(dp(12), dp(10)),
+                          spacing=dp(5))
+        with card.canvas.before:
+            Color(*(COLOR_BUBBLE_MINE if mine else COLOR_CARD))
+            self._rect = RoundedRectangle(pos=card.pos, size=card.size,
+                                           radius=[dp(14)])
+        card.bind(pos=self._sync, size=self._sync)
+        self._card = card
+
+        name = Label(text=escape_markup(filename), bold=True,
+                      font_size=dp(14), color=COLOR_TEXT, halign="left",
+                      shorten=True, shorten_from="right",
+                      size_hint_y=None, height=dp(20))
+        name.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        self._status = Label(text="", markup=True, font_size=dp(12),
+                              color=COLOR_TEXT_DIM, halign="left",
+                              shorten=True, shorten_from="right",
+                              size_hint_y=None, height=dp(18))
+        self._status.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+
+        self._bar = Widget(size_hint_y=None, height=dp(5))
+        with self._bar.canvas:
+            Color(0.22, 0.19, 0.36, 1)
+            self._track = RoundedRectangle(radius=[dp(2.5)])
+            Color(*COLOR_PRIMARY)
+            self._fill = RoundedRectangle(radius=[dp(2.5)])
+        self._bar.bind(pos=self._sync_bar, size=self._sync_bar)
+
+        self._btn_holder = BoxLayout(size_hint_y=None, height=0)
+
+        card.add_widget(name)
+        card.add_widget(self._status)
+        card.add_widget(self._bar)
+        card.add_widget(self._btn_holder)
+
+        if mine:
+            self.add_widget(Widget())
+            self.add_widget(card)
+        else:
+            self.add_widget(card)
+            self.add_widget(Widget())
+        self._fit()
+
+    def _fit(self):
+        base = dp(10) * 2 + dp(20) + dp(18) + dp(5) + dp(5) * 3
+        self._card.height = base + self._btn_holder.height
+        self.height = self._card.height + dp(4)
+
+    def _sync(self, *_args):
+        self._rect.pos = self._card.pos
+        self._rect.size = self._card.size
+
+    def _sync_bar(self, *_args):
+        x, y = self._bar.pos
+        w, h = self._bar.size
+        self._track.pos = (x, y)
+        self._track.size = (w, h)
+        self._fill.pos = (x, y)
+        self._fill.size = (w * self._frac, h)
+
+    def _set_fraction(self, frac):
+        self._frac = min(max(frac, 0.0), 1.0)
+        self._sync_bar()
+
+    def _set_button(self, label):
+        self._btn_holder.clear_widgets()
+        if label:
+            btn = RoundButton(bg=COLOR_PRIMARY, text=label, bold=True,
+                               color=(1, 1, 1, 1), font_size=dp(12),
+                               size_hint=(None, None), size=(dp(100), dp(30)))
+            btn.bind(on_release=lambda *_: self._on_action
+                     and self._on_action(self))
+            self._btn_holder.height = dp(36)
+            self._btn_holder.add_widget(btn)
+        else:
+            self._btn_holder.height = 0
+        self._fit()
+
+    # -- states -----------------------------------------------------------
+
+    def mark_preparing(self):
+        self._status.text = "Preparing…"
+        self._set_fraction(0)
+        self._set_button(None)
+
+    def set_progress(self, done):
+        frac = (done / self.file_size) if self.file_size else 0
+        self._set_fraction(frac)
+        verb = "Sending" if self._mine else "Receiving"
+        self._status.text = (f"{verb}… {int(frac * 100)}%  "
+                             f"({format_size(done)} of {format_size(self.file_size)})")
+        self._set_button(None)
+
+    def mark_delivered(self):
+        self._set_fraction(1)
+        self._status.text = (f"{format_size(self.file_size)} "
+                             f"{ticks_markup('delivered')} Delivered")
+        self._set_button(None)
+
+    def mark_seen(self):
+        self._set_fraction(1)
+        self._status.text = (f"{format_size(self.file_size)} "
+                             f"{ticks_markup('seen')} Seen")
+        self._set_button(None)
+
+    def mark_received(self, saved_to=""):
+        self._set_fraction(1)
+        note = f" – saved to {saved_to}" if saved_to else ""
+        self._status.text = f"Received  ({format_size(self.file_size)}){note}"
+        self._set_button(None)
+
+    def mark_failed(self, can_retry=False):
+        self._status.text = "[color=#f55b6b]Failed[/color]"
+        self._set_button("Retry" if can_retry else None)
+
+    def mark_interrupted(self, done):
+        frac = (done / self.file_size) if self.file_size else 0
+        self._set_fraction(frac)
+        self._status.text = (f"[color=#f5c96b]Interrupted at "
+                             f"{int(frac * 100)}%[/color]")
+        self._set_button("Resume")
+
+
 class DateChip(BoxLayout):
     """Centered rounded chip marking a day boundary in the chat history -
     'Today' / 'Yesterday' / '28 Jun 2026'."""
@@ -1447,11 +1600,13 @@ class ChatScreen(Screen):
         self.peer_status = self._base_status
         self._last_day = None
         self._bubbles = {}  # msg_id -> ChatBubble (mine only, for receipts)
+        self._file_bubbles = {}  # transfer_id -> FileBubble
         self._typing_sent = False
         self._typing_last = 0.0
         self.ids.message_list.clear_widgets()
         self.load_history()
         App.get_running_app().set_viewing(peer)
+        Clock.schedule_once(lambda dt: self._load_pending_transfers(), 0.2)
 
     def load_history(self):
         app = App.get_running_app()
@@ -1474,13 +1629,31 @@ class ChatScreen(Screen):
                 self.append_event(self._call_log_text(item), timestamp=item["timestamp"])
             elif kind == "file":
                 path = item.get("path") or ""
+                mine = item["direction"] == "out"
                 if (item["status"] == "completed" and path
                         and path.lower().endswith(IMAGE_EXTS)
                         and os.path.exists(path)):
-                    self.append_image(path, mine=item["direction"] == "out",
+                    self.append_image(path, mine=mine,
                                       timestamp=item["timestamp"])
+                    continue
+                bubble = self._ensure_file_bubble(
+                    item.get("transfer_id"), item["filename"],
+                    item.get("size") or 0, mine=mine,
+                    timestamp=item["timestamp"])
+                if item["status"] == "completed":
+                    if mine:
+                        if item.get("receipt") == "seen":
+                            bubble.mark_seen()
+                        else:
+                            bubble.mark_delivered()
+                    else:
+                        bubble.mark_received()
                 else:
-                    self.append_event(self._file_log_text(item), timestamp=item["timestamp"])
+                    if mine and path and os.path.exists(path):
+                        bubble.src_path = path
+                        bubble.mark_failed(can_retry=True)
+                    else:
+                        bubble.mark_failed(can_retry=False)
 
     def on_back(self):
         App.get_running_app().set_viewing(None)
@@ -1636,6 +1809,7 @@ class ChatScreen(Screen):
             self.ids.message_list.clear_widgets()
             self._last_day = None
             self._bubbles = {}
+            self._file_bubbles = {}
             popup.dismiss()
 
         clear_btn.bind(on_release=do_clear)
@@ -1685,16 +1859,77 @@ class ChatScreen(Screen):
                     Clock.schedule_once(lambda dt: self.append_event(
                         "Couldn't read that file - try picking it again"), 0)
                     return
-            Clock.schedule_once(lambda dt: self.append_event(
-                f"Sending {os.path.basename(local)}…"), 0)
+            try:
+                size = os.path.getsize(local)
+            except OSError:
+                size = 0
+            tid = FileTransferManager.transfer_id_for(
+                peer["id"], os.path.basename(local), size)
+
+            def show_bubble(_dt):
+                bubble = self._ensure_file_bubble(
+                    tid, os.path.basename(local), size, mine=True)
+                bubble.src_path = local
+                bubble.mark_preparing()
+
+            Clock.schedule_once(show_bubble, 0)
             app.backend.send_file(peer["id"], peer["name"], peer["ip"], local)
 
         threading.Thread(target=do_send, daemon=True).start()
+
+    def _ensure_file_bubble(self, transfer_id, filename, size, mine,
+                            timestamp=None):
+        bubble = (self._file_bubbles.get(transfer_id)
+                  if transfer_id and self._file_bubbles is not None else None)
+        if bubble is not None:
+            return bubble
+        ts = timestamp or time.time()
+        self._maybe_date_chip(ts)
+        bubble = FileBubble(filename, size, mine, transfer_id=transfer_id,
+                            on_action=self._file_action)
+        if transfer_id and self._file_bubbles is not None:
+            self._file_bubbles[transfer_id] = bubble
+        self.ids.message_list.add_widget(bubble)
+        Clock.schedule_once(lambda dt: setattr(self.ids.chat_scroll, "scroll_y", 0), 0.05)
+        return bubble
+
+    def _remove_file_bubble(self, transfer_id):
+        bubble = (self._file_bubbles.pop(transfer_id, None)
+                  if transfer_id and self._file_bubbles is not None else None)
+        if bubble is not None:
+            self.ids.message_list.remove_widget(bubble)
+
+    def _file_action(self, bubble):
+        """Retry/Resume: just send again - the receiver acks how much it
+        already has, so an interrupted transfer continues where it left off."""
+        if not self.peer or not bubble.src_path:
+            return
+        app = App.get_running_app()
+        bubble.mark_preparing()
+        app.backend.send_file(self.peer["id"], self.peer["name"],
+                              self.peer["ip"], bubble.src_path)
+
+    def _load_pending_transfers(self):
+        """Interrupted outgoing sends survive app restarts (transfers
+        table) - offer to resume them whenever this chat opens."""
+        app = App.get_running_app()
+        if not self.peer or not app.backend:
+            return
+        for t in (app.backend.pending_transfers(self.peer["id"]) or []):
+            bubble = self._ensure_file_bubble(
+                t["transfer_id"], t["filename"], t.get("size") or 0, mine=True)
+            bubble.src_path = t.get("path")
+            bubble.mark_interrupted(t.get("bytes_done", 0))
 
     def update_message_status(self, msg_id, status):
         bubble = self._bubbles.get(msg_id) if self._bubbles else None
         if bubble:
             bubble.set_status(status)
+            return
+        # receipt ids are also file transfer_ids
+        fb = self._file_bubbles.get(msg_id) if self._file_bubbles else None
+        if fb and status == "seen":
+            fb.mark_seen()
 
     def _maybe_date_chip(self, ts):
         day = time.localtime(ts)[:3]
@@ -1733,21 +1968,46 @@ class ChatScreen(Screen):
     def receive_file_event(self, event):
         if not self.peer or self.peer.get("id") != event.get("peer_id"):
             return
-        direction = "in" if event["event"] == "file_received" else "out"
+        ev = event.get("event")
+        tid = event.get("transfer_id")
+        filename = event.get("filename", "file")
+        size = event.get("size", 0)
         path = event.get("path") or ""
-        if (event.get("status") == "completed" and path
-                and path.lower().endswith(IMAGE_EXTS) and os.path.exists(path)):
-            self.append_image(path, mine=direction == "out")
-            return
-        row = {"direction": direction, "filename": event["filename"],
-               "size": event.get("size", 0), "status": event.get("status", "failed")}
-        text = self._file_log_text(row)
-        if event.get("saved_to"):
-            text += f" – saved to {event['saved_to']}"
-        on_retry = None
-        if event["event"] == "file_send_failed" and event.get("path"):
-            on_retry = lambda: self._start_file_send(event["path"])
-        self.append_event(text, on_retry=on_retry)
+        is_image = (path.lower().endswith(IMAGE_EXTS) and os.path.exists(path))
+
+        if ev == "file_incoming":
+            bubble = self._ensure_file_bubble(tid, filename, size, mine=False)
+            bubble.set_progress(event.get("done", 0))
+        elif ev == "file_progress":
+            bubble = self._ensure_file_bubble(
+                tid, filename, size, mine=event.get("direction") == "out")
+            bubble.set_progress(event.get("done", 0))
+        elif ev == "file_sent":
+            if is_image:
+                self._remove_file_bubble(tid)
+                self.append_image(path, mine=True)
+            else:
+                bubble = self._ensure_file_bubble(tid, filename, size, mine=True)
+                bubble.src_path = path or bubble.src_path
+                bubble.mark_delivered()
+        elif ev == "file_send_failed":
+            bubble = self._ensure_file_bubble(tid, filename, size, mine=True)
+            if path:
+                bubble.src_path = path
+            bubble.mark_failed(can_retry=bool(bubble.src_path))
+        elif ev == "file_received":
+            if event.get("status") == "completed":
+                if is_image:
+                    self._remove_file_bubble(tid)
+                    self.append_image(path, mine=False)
+                else:
+                    bubble = self._ensure_file_bubble(tid, filename, size,
+                                                      mine=False)
+                    bubble.mark_received(event.get("saved_to", ""))
+            else:
+                bubble = self._ensure_file_bubble(tid, filename, size,
+                                                  mine=False)
+                bubble.mark_failed(can_retry=False)
 
     # No emoji in these lines - Kivy's bundled Roboto has no emoji glyphs,
     # so anything like a paperclip or phone renders as a hollow box.
@@ -1856,7 +2116,35 @@ class LancomApp(App):
         self.store = Store(os.path.join(self.user_data_dir, "lancom.db"),
                            self.identity.storage_key())
 
+        # Android back button (key 27): navigate inside the app instead of
+        # killing the activity. Popups grab the key first and dismiss
+        # themselves, so this only sees it with no popup open.
+        Window.bind(on_keyboard=self._on_hardware_key)
+
         return Builder.load_string(KV)
+
+    def _on_hardware_key(self, _window, key, *_args):
+        if key != 27:
+            return False
+        cur = self.root.current if self.root else None
+        if cur == "chat":
+            self.root.get_screen("chat").on_back()
+            return True
+        if cur == "call":
+            # No accidental hangups - the call buttons are the only exit.
+            return True
+        if cur in ("users", "pin", "setup"):
+            # Root screens: minimize like WhatsApp does; the service keeps
+            # running either way.
+            if platform == "android":
+                try:
+                    from jnius import autoclass
+                    autoclass("org.kivy.android.PythonActivity"
+                              ).mActivity.moveTaskToBack(True)
+                    return True
+                except Exception:
+                    return False
+        return False
 
     def on_start(self):
         if platform == "android":

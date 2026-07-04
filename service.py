@@ -122,6 +122,8 @@ def handle_command(cmd):
         core.send_file(cmd["peer_id"], cmd["peer_name"], cmd["peer_ip"],
                        cmd["path"])
         return {"ok": True}
+    if op == "pending_transfers":
+        return {"ok": True, "transfers": core.pending_transfers(cmd["peer_id"])}
     return {"ok": False, "error": f"unknown command {op!r}"}
 
 

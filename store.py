@@ -94,6 +94,12 @@ class Store:
             for ddl in (
                 "ALTER TABLE peers ADD COLUMN pubkey TEXT",
                 "ALTER TABLE peers ADD COLUMN device TEXT",
+                # File-transfer receipts, keyed by transfer_id:
+                # outgoing rows carry receipt ('' | 'seen'); incoming rows
+                # track whether we've already told the sender we saw it.
+                "ALTER TABLE files ADD COLUMN transfer_id TEXT",
+                "ALTER TABLE files ADD COLUMN receipt TEXT DEFAULT ''",
+                "ALTER TABLE files ADD COLUMN seen_receipt_sent INTEGER DEFAULT 0",
                 "ALTER TABLE messages ADD COLUMN msg_id TEXT",
                 # Outgoing: '' (pre-status rows) | pending | delivered | seen.
                 "ALTER TABLE messages ADD COLUMN status TEXT DEFAULT ''",
@@ -312,21 +318,24 @@ class Store:
 
     # -- file transfers ---------------------------------------------------
 
-    def add_file_record(self, peer_id, peer_name, direction, filename, size, path, status):
+    def add_file_record(self, peer_id, peer_name, direction, filename, size,
+                        path, status, transfer_id=None):
         ts = time.time()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO files (peer_id, peer_name, direction, filename, size, path, status, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO files (peer_id, peer_name, direction, filename, size, "
+                "path, status, timestamp, transfer_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (peer_id, peer_name, direction, self._seal(filename), size,
-                 self._seal(path), status, ts),
+                 self._seal(path), status, ts, transfer_id),
             )
             self._conn.commit()
 
     def get_files(self, peer_id, limit=100):
         with self._lock:
             cur = self._conn.execute(
-                "SELECT direction, filename, size, path, status, timestamp FROM files "
+                "SELECT direction, filename, size, path, status, timestamp, "
+                "transfer_id, receipt FROM files "
                 "WHERE peer_id=? ORDER BY timestamp ASC LIMIT ?",
                 (peer_id, limit),
             )
@@ -335,7 +344,55 @@ class Store:
             {
                 "direction": r[0], "filename": self._unseal(r[1]), "size": r[2],
                 "path": self._unseal(r[3]), "status": r[4], "timestamp": r[5],
+                "transfer_id": r[6], "receipt": r[7] or "",
             }
+            for r in rows
+        ]
+
+    def set_file_receipt(self, transfer_id, kind):
+        """'Seen' receipt for an outgoing file, keyed by transfer_id.
+        Returns True when a row actually changed."""
+        if kind != "seen" or not transfer_id:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE files SET receipt='seen' "
+                "WHERE transfer_id=? AND direction='out' AND receipt=''",
+                (transfer_id,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def get_unseen_incoming_file_ids(self, peer_id):
+        """Completed incoming files we haven't sent a 'seen' receipt for."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT transfer_id FROM files WHERE peer_id=? AND direction='in' "
+                "AND status='completed' AND transfer_id IS NOT NULL "
+                "AND seen_receipt_sent=0", (peer_id,))
+            return [r[0] for r in cur.fetchall()]
+
+    def mark_file_seen_receipts_sent(self, peer_id, transfer_ids):
+        if not transfer_ids:
+            return
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE files SET seen_receipt_sent=1 "
+                "WHERE peer_id=? AND transfer_id=?",
+                [(peer_id, tid) for tid in transfer_ids])
+            self._conn.commit()
+
+    def get_interrupted_outgoing(self, peer_id):
+        """Outgoing transfers that stopped partway (connection loss, app
+        kill) - offered as 'Resume' in the chat when the peer is back."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT id, filename, path, size, bytes_done FROM transfers "
+                "WHERE peer_id=? AND direction='out' AND status='in_progress'",
+                (peer_id,))
+            rows = cur.fetchall()
+        return [
+            {"transfer_id": r[0], "filename": self._unseal(r[1]),
+             "path": self._unseal(r[2]), "size": r[3], "bytes_done": r[4]}
             for r in rows
         ]
 

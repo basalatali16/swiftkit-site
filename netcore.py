@@ -742,7 +742,11 @@ class MessageServer:
                 if kind not in ("delivered", "seen"):
                     return
                 for mid in msg.get("msg_ids", []):
-                    if self.store.set_message_status(mid, kind) and self.on_receipt:
+                    # ids are message msg_ids or file transfer_ids - they
+                    # share the receipt channel.
+                    updated = (self.store.set_message_status(mid, kind)
+                               or self.store.set_file_receipt(mid, kind))
+                    if updated and self.on_receipt:
                         self.on_receipt(mid, kind)
                 return
 
@@ -1271,6 +1275,18 @@ class FileTransferManager:
         self.files_dir = files_dir
         self.on_event = on_event  # callback(event_dict) - worker threads
         self._running = False
+        self._progress_ts = {}  # transfer_id -> last progress emit time
+
+    def _progress(self, transfer_id, peer_id, direction, filename, done, size):
+        """Throttled live progress for the chat UI - at most 2/s per
+        transfer so GB files don't flood the control channel."""
+        now = time.time()
+        if now - self._progress_ts.get(transfer_id, 0) < 0.5:
+            return
+        self._progress_ts[transfer_id] = now
+        self.on_event({"event": "file_progress", "transfer_id": transfer_id,
+                        "peer_id": peer_id, "direction": direction,
+                        "filename": filename, "done": done, "size": size})
 
     def start(self):
         self._running = True
@@ -1365,6 +1381,10 @@ class FileTransferManager:
                 self._finish_incoming(transfer_id, peer_id, peer_name, filename, size, dest_path, "completed")
                 return
 
+            self.on_event({"event": "file_incoming", "transfer_id": transfer_id,
+                            "peer_id": peer_id, "peer_name": peer_name,
+                            "filename": filename, "size": size, "done": offset})
+
             received = offset
             chunk_index = 0
             status = "failed"
@@ -1384,6 +1404,8 @@ class FileTransferManager:
                         chunk_index += 1
                         if chunk_index % self.PROGRESS_CHECKPOINT_CHUNKS == 0:
                             self.store.update_transfer_progress(transfer_id, received)
+                            self._progress(transfer_id, peer_id, "in",
+                                           filename, received, size)
                 if received == size:
                     status = "completed"
             except OSError:
@@ -1432,9 +1454,12 @@ class FileTransferManager:
                     pass
                 final_path = ""
             self.store.finish_transfer(transfer_id, "completed")
-            self.store.add_file_record(peer_id, peer_name, "in", filename, size, final_path, "completed")
+            self.store.add_file_record(peer_id, peer_name, "in", filename, size,
+                                       final_path, "completed",
+                                       transfer_id=transfer_id)
         self.on_event({"event": "file_received", "peer_id": peer_id, "peer_name": peer_name,
                         "filename": filename, "size": size, "status": status,
+                        "transfer_id": transfer_id,
                         "path": final_path, "saved_to": saved_to})
 
     def send_file(self, peer_id, peer_name, peer_ip, file_path):
@@ -1495,6 +1520,8 @@ class FileTransferManager:
                         sent_total += len(chunk)
                         if chunk_index % self.PROGRESS_CHECKPOINT_CHUNKS == 0:
                             self.store.update_transfer_progress(transfer_id, sent_total)
+                            self._progress(transfer_id, peer_id, "out",
+                                           filename, sent_total, size)
             status = "completed"
         except OSError:
             status = "failed"
@@ -1502,7 +1529,9 @@ class FileTransferManager:
         self.store.update_transfer_progress(transfer_id, sent_total)
         if status == "completed":
             self.store.finish_transfer(transfer_id, "completed")
-            self.store.add_file_record(peer_id, peer_name, "out", filename, size, file_path, "completed")
+            self.store.add_file_record(peer_id, peer_name, "out", filename, size,
+                                       file_path, "completed",
+                                       transfer_id=transfer_id)
 
         self.on_event({"event": "file_sent" if status == "completed" else "file_send_failed",
                         "peer_id": peer_id, "peer_name": peer_name,
@@ -1620,6 +1649,8 @@ class NetworkCore:
     def chat_opened(self, peer_id, peer_ip):
         self.mark_seen(peer_id, peer_ip,
                        self.store.get_unseen_incoming_ids(peer_id))
+        self.mark_files_seen(peer_id, peer_ip,
+                             self.store.get_unseen_incoming_file_ids(peer_id))
         threading.Thread(target=self.message_server.flush_outbox,
                           args=(peer_id, peer_ip), daemon=True).start()
 
@@ -1630,6 +1661,28 @@ class NetworkCore:
         self.store.mark_seen_receipts_sent(peer_id, msg_ids)
         self.message_server.send_receipt(peer_id, peer_ip, msg_ids, "seen",
                                          background=True)
+
+    def mark_files_seen(self, peer_id, peer_ip, transfer_ids):
+        transfer_ids = [t for t in transfer_ids if t]
+        if not transfer_ids:
+            return
+        if not peer_ip:
+            for p in self.store.get_known_peers():
+                if p["id"] == peer_id:
+                    peer_ip = p["ip"]
+                    break
+        self.store.mark_file_seen_receipts_sent(peer_id, transfer_ids)
+        self.message_server.send_receipt(peer_id, peer_ip, transfer_ids,
+                                         "seen", background=True)
+
+    def pending_transfers(self, peer_id):
+        """Interrupted outgoing sends for this peer whose source file still
+        exists - the chat offers a Resume button for each."""
+        out = []
+        for t in self.store.get_interrupted_outgoing(peer_id):
+            if t.get("path") and os.path.exists(t["path"]):
+                out.append(t)
+        return out
 
     def send_typing(self, peer_id, peer_ip, typing):
         if self.message_server:
@@ -1720,7 +1773,13 @@ class EventPolicy:
                                         "Missed call")
         elif kind == "file":
             e = ev.get("event", {})
-            if (not self.foreground and e.get("event") == "file_received"
+            if (e.get("event") == "file_received"
                     and e.get("status") == "completed"):
-                self.notify_message(e.get("peer_name", "Unknown"),
-                                    f"Sent you {e.get('filename', 'a file')}")
+                if self.foreground and self.viewing == e.get("peer_id"):
+                    # File is on screen right now -> 'seen' straight away.
+                    if e.get("transfer_id"):
+                        self.core.mark_files_seen(e["peer_id"], None,
+                                                  [e["transfer_id"]])
+                else:
+                    self.notify_message(e.get("peer_name", "Unknown"),
+                                        f"Sent you {e.get('filename', 'a file')}")
