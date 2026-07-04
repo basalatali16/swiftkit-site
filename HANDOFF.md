@@ -182,6 +182,10 @@ user_data_dir == ANDROID_PRIVATE on android), so identity/DB carry over.
 Owner asked to auto-continue when their limit resets (Sat 2026-07-04
 ~03:09 local). A one-time scheduled task handles the resume.
 
+UPDATE 2026-07-04 08:20: builds #19/#20/#21 all GREEN. #21 link given
+to the owner with the full test checklist. Awaiting their device test;
+then the Windows PC app milestone starts.
+
 Where things stand RIGHT NOW:
 - Build #21 (run id 28678453829) = v0.7.1 FINAL Android APK was
   in_progress when the session ended. It contains EVERYTHING: sticky
