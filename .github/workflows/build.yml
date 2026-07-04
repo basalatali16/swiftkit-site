@@ -1,0 +1,113 @@
+name: Build LANCOM APK
+
+on:
+  push:
+    branches:
+      - main
+      - "claude/**"
+    paths:
+      # "**.py" not just main.py: the app was split into main.py (crash-
+      # reporter entry) + lancom_app.py + modules - a fix in any of them
+      # must trigger a build.
+      - "**.py"
+      - "buildozer.spec"
+      - "assets/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache buildozer global cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer-global-cache
+          key: buildozer-global-${{ hashFiles('buildozer.spec') }}
+
+      # cryptography (added for end-to-end encryption) compiles a Rust
+      # extension - there's no prebuilt wheel for Android, so p4a builds it
+      # from source, which needs a real Rust toolchain. Cached across runs
+      # the same way as the buildozer packages cache below.
+      - name: Cache Rust toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup-cache
+            ~/.cargo-cache
+          key: rust-toolchain-${{ runner.os }}
+
+      # kivy/buildozer's entrypoint.sh dynamically maps the container user to
+      # the host UID/GID (chown -R on /home/user) and runs buildozer via
+      # `sudo --preserve-env --user <mapped> ... -- buildozer "$@"` - it does
+      # NOT accept arbitrary commands, only buildozer's own args. Overriding
+      # --entrypoint to inject a "install rust first" step skips that whole
+      # mechanism, so buildozer ends up running as literal root (crashes on
+      # its own interactive root-check prompt in non-interactive CI) - that's
+      # exactly what broke the previous attempt at this fix.
+      #
+      # Instead: install Rust in a separate step that overrides the
+      # entrypoint (safe here since this step never runs buildozer, so the
+      # user-mapping/root-check concerns don't apply - and entrypoint.sh's
+      # chown -R on the next step fixes ownership regardless of which UID
+      # wrote these files). Then run the *unmodified* entrypoint for the
+      # actual build, adding cargo's bin dir to PATH via `docker run -e` so
+      # entrypoint.sh's own `PATH="$HOME/.venv/bin:$PATH"` picks it up.
+      - name: Install Rust toolchain for cryptography's build
+        run: |
+          mkdir -p ~/.rustup-cache ~/.cargo-cache
+          docker run --rm \
+            --volume "$HOME/.rustup-cache":/home/user/.rustup \
+            --volume "$HOME/.cargo-cache":/home/user/.cargo \
+            --entrypoint bash \
+            kivy/buildozer:latest \
+            -c '
+              if [ ! -x /home/user/.cargo/bin/rustc ]; then
+                apt-get update -qq
+                apt-get install -y -qq curl
+                export HOME=/home/user
+                curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+              fi
+            '
+
+      # Runs the official kivy/buildozer Docker image directly rather than
+      # going through a third-party wrapper action - a prior run showed
+      # ArtemSBulgakov/buildozer-action@v1 building its own Dockerfile on
+      # top of that image (to add a newer JDK via the openjdk-r PPA), and
+      # that PPA 404s against current ubuntu-latest runners. The kivy/buildozer
+      # image already ships a working JDK, so no extra layer is needed.
+      # Stable debug signing key (repo secret LANCOM_KEYSTORE_B64).
+      # Without it each CI run generates a fresh throwaway keystore, so
+      # Android refuses to install any new build over a previously
+      # installed one ("App not installed" - signature mismatch). One
+      # fixed key = updates install over each other like a real app.
+      # If the secret is absent the dir stays empty and buildozer falls
+      # back to generating a keystore (old behavior).
+      - name: Restore stable debug keystore
+        env:
+          LANCOM_KEYSTORE_B64: ${{ secrets.LANCOM_KEYSTORE_B64 }}
+        run: |
+          mkdir -p ~/.android-lancom
+          if [ -n "$LANCOM_KEYSTORE_B64" ]; then
+            echo "$LANCOM_KEYSTORE_B64" | base64 -d > ~/.android-lancom/debug.keystore
+          fi
+
+      - name: Build APK with buildozer
+        run: |
+          mkdir -p ~/.buildozer-global-cache
+          docker run --rm \
+            --volume "${{ github.workspace }}":/home/user/hostcwd \
+            --volume "$HOME/.buildozer-global-cache":/home/user/.buildozer \
+            --volume "$HOME/.android-lancom":/home/user/.android \
+            --volume "$HOME/.rustup-cache":/home/user/.rustup \
+            --volume "$HOME/.cargo-cache":/home/user/.cargo \
+            --env PATH="/home/user/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            kivy/buildozer:latest android debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lancom-debug-apk
+          path: bin/*.apk
