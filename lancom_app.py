@@ -646,6 +646,32 @@ ScreenManager:
                 pos_hint: {"center_y": 0.5}
                 on_release: root.show_add_ip_popup()
 
+        BoxLayout:
+            size_hint_y: None
+            height: dp(46)
+            padding: dp(10), dp(5)
+            BoxLayout:
+                padding: dp(14), dp(2)
+                canvas.before:
+                    Color:
+                        rgba: 0.115, 0.10, 0.21, 1
+                    RoundedRectangle:
+                        pos: self.pos
+                        size: self.size
+                        radius: [self.height / 2.0]
+                TextInput:
+                    id: search_input
+                    multiline: False
+                    hint_text: "Search contacts"
+                    background_normal: ""
+                    background_active: ""
+                    background_color: 0, 0, 0, 0
+                    foreground_color: 0.96, 0.95, 1, 1
+                    hint_text_color: 0.55, 0.52, 0.66, 1
+                    cursor_color: 0.72, 0.62, 1, 1
+                    padding: dp(4), max(0, (self.height - self.line_height) / 2)
+                    on_text: root.on_search(self.text)
+
         Label:
             id: debug_info
             text: ""
@@ -968,12 +994,18 @@ class ContactRow(BoxLayout):
 
 
 class UsersScreen(Screen):
+    _query = ""
+
     def on_pre_enter(self):
         Clock.schedule_interval(self.refresh, 1.5)
         self.refresh(0)
 
     def on_leave(self):
         Clock.unschedule(self.refresh)
+
+    def on_search(self, text):
+        self._query = text.strip().lower()
+        self.refresh(0)
 
     def refresh(self, _dt):
         app = App.get_running_app()
@@ -988,10 +1020,14 @@ class UsersScreen(Screen):
             f"|  broadcasting to: {state['broadcast_ip']}"
         )
         peers = state["peers"]
+        if self._query:
+            peers = [p for p in peers if self._query in p["name"].lower()]
         container = self.ids.peer_list
         container.clear_widgets()
         if not peers:
-            container.add_widget(Label(text="Searching for devices on this WiFi...",
+            empty = ("No contacts match your search" if self._query
+                     else "Searching for devices on this WiFi...")
+            container.add_widget(Label(text=empty,
                                         size_hint_y=None, height=40,
                                         color=(0.55, 0.52, 0.66, 1)))
         for peer in peers:
@@ -1840,6 +1876,14 @@ class LancomApp(App):
             # Not a runtime permission - a separate system settings prompt,
             # so it's requested after the batch above rather than mixed in.
             Clock.schedule_once(lambda dt: android_notify.request_ignore_battery_optimizations(), 1.5)
+            # Answer/Decline buttons on the incoming-call notification
+            # (re)open this activity with an extra telling us what to do.
+            try:
+                from android import activity as android_activity
+                android_activity.bind(on_new_intent=self._on_new_intent)
+            except Exception:
+                pass
+            Clock.schedule_once(lambda dt: self._consume_launch_intent(), 0.5)
 
         if self.profile_store.exists("profile"):
             name = self.profile_store.get("profile").get("name", "")
@@ -1907,6 +1951,54 @@ class LancomApp(App):
             self._locked = True
             self.root.current = "pin"
 
+    # -- Answer/Decline from the call notification -------------------------
+
+    def _on_new_intent(self, intent):
+        try:
+            action = intent.getStringExtra("ipphone_call_action")
+            if action:
+                intent.removeExtra("ipphone_call_action")
+        except Exception:
+            return
+        if action:
+            Clock.schedule_once(
+                lambda dt: self._handle_call_action(action, 10), 0)
+
+    def _consume_launch_intent(self):
+        """Cold start from a notification button: the triggering intent is
+        the activity's launch intent, so on_new_intent never fires for it."""
+        try:
+            from jnius import autoclass
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            intent = activity.getIntent()
+            action = intent.getStringExtra("ipphone_call_action") if intent else None
+            if action:
+                intent.removeExtra("ipphone_call_action")
+                self._handle_call_action(action, 10)
+        except Exception:
+            pass
+
+    def _handle_call_action(self, action, retries):
+        """Forward the notification-button choice to the service. On a
+        cold start the control connection may still be dialing - retry
+        briefly instead of dropping the user's answer."""
+        connected = (not isinstance(self.backend, ServiceBackend)
+                     or self.backend.client.connected)
+        if not connected:
+            if retries > 0:
+                Clock.schedule_once(
+                    lambda dt: self._handle_call_action(action, retries - 1), 0.5)
+            return
+        if action == "accept":
+            self.backend.accept_call()
+            call_screen = self.root.get_screen("call")
+            call_screen.status_text = "Connecting..."
+            call_screen.show_accept = False
+            self.root.transition = SlideTransition(direction="up")
+            self.root.current = "call"
+        elif action == "reject":
+            self.backend.reject_call()
+
     def set_viewing(self, peer):
         """ChatScreen tells us which conversation is on screen (or None).
         The backend uses it to route notify-vs-mark-seen decisions."""
@@ -1959,6 +2051,11 @@ class LancomApp(App):
             call_screen.on_ringing(event["peer_name"])
         elif kind == "call_active":
             call_screen.on_active(event["peer_name"])
+            # A call answered from the notification connects while the
+            # app is still opening - make sure the call UI is on screen.
+            if self.root.current != "call":
+                self.root.transition = SlideTransition(direction="up")
+                self.root.current = "call"
         elif kind == "call_rejected":
             reason = ("is busy on another call"
                       if event.get("reason") == "busy" else "declined")

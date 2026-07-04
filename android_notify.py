@@ -22,9 +22,23 @@ CALL_NOTIF_ID = 2
 # kept here so the GC can't collect them, which would release them.
 _held_locks = []
 
-# The looping Ringtone for the currently ringing incoming call.
+# Currently ringing incoming call: looping MediaPlayer (or Ringtone
+# fallback) + vibrator, held so stop_ringing() can silence them.
+_ring_player = None
 _ringtone = None
-_ring_lock = None
+_vibrator = None
+
+
+def _ring_log(msg):
+    """Ring failures are otherwise invisible on a sideloaded phone -
+    keep a breadcrumb file we can ask the owner for."""
+    try:
+        base = os.environ.get("ANDROID_PRIVATE", ".")
+        with open(os.path.join(base, "ring_debug.log"), "a",
+                  encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
 
 
 def _context():
@@ -152,29 +166,64 @@ def notify_incoming_call(peer_name):
 
 
 def start_ringing(peer_name, show_notification=True):
-    """Ring like a phone: loop the device ringtone until stop_ringing().
-    With show_notification (app not visible) also post a full-screen
-    CATEGORY_CALL notification - on a locked phone that lights the screen
-    with the incoming-call alert, and tapping it opens the app straight
-    into the call screen (the UI re-syncs call state on connect)."""
+    """Ring like a phone until stop_ringing(): loop the device ringtone
+    with MediaPlayer on the ring stream (reliable on every Android
+    version - Ringtone.setLooping needs API 28 and quietly fails on some
+    OEMs), vibrate in a call pattern, and with show_notification post a
+    full-screen CATEGORY_CALL notification with Answer/Decline buttons
+    that wakes a locked screen."""
     if not IS_ANDROID:
         return
-    global _ringtone
+    global _ring_player, _ringtone, _vibrator
     stop_ringing()
+
+    from jnius import autoclass
+    ctx = _context()
+
+    # -- looping ringtone --------------------------------------------------
     try:
-        from jnius import autoclass
+        MediaPlayer = autoclass("android.media.MediaPlayer")
         RingtoneManager = autoclass("android.media.RingtoneManager")
-        Build_VERSION = autoclass("android.os.Build$VERSION")
-        ctx = _context()
+        AudioAttributes = autoclass("android.media.AudioAttributes")
+        AABuilder = autoclass("android.media.AudioAttributes$Builder")
         uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-        ringtone = RingtoneManager.getRingtone(ctx, uri)
-        if ringtone is not None:
-            if Build_VERSION.SDK_INT >= 28:
-                ringtone.setLooping(True)
-            ringtone.play()
-            _ringtone = ringtone
-    except Exception:
-        pass
+        player = MediaPlayer()
+        player.setDataSource(ctx, uri)
+        attrs = (AABuilder()
+                 .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                 .build())
+        player.setAudioAttributes(attrs)
+        player.setLooping(True)
+        player.prepare()
+        player.start()
+        _ring_player = player
+    except Exception as exc:
+        _ring_log(f"MediaPlayer ring failed: {exc!r}")
+        # Fallback: plain Ringtone (single play on API < 28, still audible)
+        try:
+            RingtoneManager = autoclass("android.media.RingtoneManager")
+            Build_VERSION = autoclass("android.os.Build$VERSION")
+            uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+            ringtone = RingtoneManager.getRingtone(ctx, uri)
+            if ringtone is not None:
+                if Build_VERSION.SDK_INT >= 28:
+                    ringtone.setLooping(True)
+                ringtone.play()
+                _ringtone = ringtone
+        except Exception as exc2:
+            _ring_log(f"Ringtone fallback failed: {exc2!r}")
+
+    # -- vibration ---------------------------------------------------------
+    try:
+        Context = autoclass("android.content.Context")
+        vib = ctx.getSystemService(Context.VIBRATOR_SERVICE)
+        if vib is not None and vib.hasVibrator():
+            # 0ms wait, 900ms buzz, 700ms pause, repeat from index 0
+            vib.vibrate([0, 900, 700], 0)
+            _vibrator = vib
+    except Exception as exc:
+        _ring_log(f"vibrate failed: {exc!r}")
 
     if not show_notification:
         return
@@ -210,32 +259,57 @@ def start_ringing(peer_name, show_notification=True):
         builder.setCategory(Notification.CATEGORY_CALL)
         builder.setPriority(2)
 
+        Intent = autoclass("android.content.Intent")
         launch = ctx.getPackageManager().getLaunchIntentForPackage(
             ctx.getPackageName())
         if launch is not None:
-            pending = PendingIntent.getActivity(
-                ctx, 0, launch,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
+            flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+            pending = PendingIntent.getActivity(ctx, 0, launch, flags)
             builder.setContentIntent(pending)
             # Full-screen intent = wake the screen and show the call UI,
             # the way real dialers do. Needs USE_FULL_SCREEN_INTENT.
             builder.setFullScreenIntent(pending, True)
 
+            # Answer / Decline buttons: same activity launch but tagged
+            # with an extra the UI reads on (re)open and forwards to the
+            # service. Distinct requestCodes keep the intents separate.
+            icon = ctx.getApplicationInfo().icon
+            answer = Intent(launch)
+            answer.putExtra(String("ipphone_call_action"), String("accept"))
+            decline = Intent(launch)
+            decline.putExtra(String("ipphone_call_action"), String("reject"))
+            builder.addAction(icon, String("Answer"),
+                              PendingIntent.getActivity(ctx, 101, answer, flags))
+            builder.addAction(icon, String("Decline"),
+                              PendingIntent.getActivity(ctx, 102, decline, flags))
+
         manager.notify(CALL_NOTIF_ID, builder.build())
-    except Exception:
-        pass
+    except Exception as exc:
+        _ring_log(f"call notification failed: {exc!r}")
 
 
 def stop_ringing():
-    """Silence the ringtone and drop the incoming-call notification."""
+    """Silence ringtone + vibration, drop the incoming-call notification."""
     if not IS_ANDROID:
         return
-    global _ringtone
-    ringtone = _ringtone
-    _ringtone = None
+    global _ring_player, _ringtone, _vibrator
+    player, _ring_player = _ring_player, None
+    if player is not None:
+        try:
+            player.stop()
+            player.release()
+        except Exception:
+            pass
+    ringtone, _ringtone = _ringtone, None
     if ringtone is not None:
         try:
             ringtone.stop()
+        except Exception:
+            pass
+    vib, _vibrator = _vibrator, None
+    if vib is not None:
+        try:
+            vib.cancel()
         except Exception:
             pass
     try:
